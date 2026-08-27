@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import zipfile
 from datetime import date
 
 import pandas as pd
@@ -10,10 +11,8 @@ from PIL import Image
 from opportunity_assistant.reporting import (
     REQUIRED_COLUMNS,
     SHEET_NAMES,
-    build_chengdu_opportunity_png,
     build_opportunity_excel,
     build_report_bundle,
-    build_wecom_messages,
     normalize_report_dataframe,
 )
 
@@ -153,24 +152,47 @@ def test_excel_contains_all_required_sheets_and_reconciles_counts_and_amounts() 
     assert workbook.sheetnames == list(SHEET_NAMES)
 
     summary = workbook["今日商机汇总"]
-    # KPI 使用合并单元左上角存值。
-    assert summary["A5"].value == 4
-    assert summary["C5"].value == 3
-    assert summary["E5"].value == 1_585_500
-    assert summary["G5"].value == 1
-    assert summary["I5"].value == 20_000_000
-    assert summary["K5"].value == 1
+    # 汇总页复刻部门现用的五列表：两级表头、真实区县、保险/工程各两列。
+    assert summary.max_column == 5
+    assert summary.merged_cells.ranges
+    assert [summary.cell(2, column).value for column in range(1, 6)] == [
+        "区域",
+        "保险类",
+        None,
+        "工程类",
+        None,
+    ]
+    assert [summary.cell(3, column).value for column in range(1, 6)] == [
+        None,
+        "项目数",
+        "招标金额（元）",
+        "项目数",
+        "招标金额（元）",
+    ]
+    assert summary.freeze_panes == "A4"
 
     jin_niu_row = _find_summary_row(summary, "金牛区")
     assert summary.cell(jin_niu_row, 2).value == 1
     assert summary.cell(jin_niu_row, 3).value == 85_000
-    assert summary.cell(jin_niu_row, 6).value == f"=SUM(B{jin_niu_row},D{jin_niu_row})"
+
+    # 武侯区虽然无我司服务点，统计仍必须落在真实项目区县，不能落入“未明确”。
+    wuhou_row = _find_summary_row(summary, "武侯区")
+    assert summary.cell(wuhou_row, 2).value == 1
+    assert summary.cell(wuhou_row, 3).value == 500
 
     other_row = _find_summary_row(summary, "川内其他地区")
     assert summary.cell(other_row, 2).value == 1
     assert summary.cell(other_row, 3).value == 1_500_000
     assert summary.cell(other_row, 4).value == 1
     assert summary.cell(other_row, 5).value == 20_000_000
+
+    total_row = _find_summary_row(summary, "总计")
+    assert sum(summary.cell(row, 2).value for row in range(4, total_row)) == 3
+    assert sum(summary.cell(row, 3).value for row in range(4, total_row)) == 1_585_500
+    assert sum(summary.cell(row, 4).value for row in range(4, total_row)) == 1
+    assert sum(summary.cell(row, 5).value for row in range(4, total_row)) == 20_000_000
+    assert summary.cell(total_row, 2).value == f"=SUM(B4:B{total_row - 1})"
+    assert summary.cell(total_row, 5).value == f"=SUM(E4:E{total_row - 1})"
 
     # 无区域项仍保留在成都保险明细中，同时进入未分区域页。
     assert workbook["成都地区（保险）"].max_row == 6
@@ -180,20 +202,16 @@ def test_excel_contains_all_required_sheets_and_reconciles_counts_and_amounts() 
 
     compact_headers = [
         "序号",
-        "分类/险种",
+        "项目地区",
+        "分配区域",
+        "险种/项目类型",
         "项目名称",
-        "发布日期",
         "招标金额（元）",
-        "地市",
-        "区县",
-        "服务区域",
-        "项目阶段",
         "截止时间",
         "招标人/采购人",
+        "商机关键要点",
         "联系人/联系方式",
-        "代理机构",
         "原文链接",
-        "备注",
     ]
     for sheet_name in (
         "成都地区（保险）",
@@ -202,17 +220,29 @@ def test_excel_contains_all_required_sheets_and_reconciles_counts_and_amounts() 
         "川内其他地区（工程）",
     ):
         sheet = workbook[sheet_name]
-        assert sheet.max_column == 15
-        assert [sheet.cell(4, column).value for column in range(1, 16)] == compact_headers
-        assert sheet.freeze_panes == "D5"
+        assert sheet.max_column == 11
+        assert [sheet.cell(4, column).value for column in range(1, 12)] == compact_headers
+        assert sheet.freeze_panes == "E5"
 
-    # 审计页仍保留全部 19 列，便于追溯筛选和区域判断。
+    # 审计信息仍保留供内部追溯，但默认全部隐藏，正式打开只看汇总与业务子表。
     assert workbook["未分区域项目"].max_column == 19
     assert workbook["筛除记录"].max_column == 19
+    for sheet_name in ("未分区域项目", "筛除记录", "采集与判定审计", "处理日志"):
+        assert workbook[sheet_name].sheet_state == "hidden"
+    for sheet_name in (
+        "今日商机汇总",
+        "成都地区（保险）",
+        "川内其他地区（保险）",
+        "成都地区（工程）",
+        "川内其他地区（工程）",
+    ):
+        assert workbook[sheet_name].sheet_state == "visible"
 
     chengdu_insurance = workbook["成都地区（保险）"]
     assert chengdu_insurance["A5"].value == 1
-    assert chengdu_insurance["D5"].number_format == "yyyy-mm-dd"
+    assert chengdu_insurance["B5"].value == "成都市-金牛区"
+    assert chengdu_insurance["F5"].number_format == '#,##0.00;[Red]-#,##0.00;0'
+    assert chengdu_insurance["G5"].number_format == "yyyy-mm-dd hh:mm"
 
     # 正式工作簿不暴露内部引擎的“待复核”术语，包括处理日志。
     for sheet in workbook.worksheets:
@@ -224,26 +254,46 @@ def test_excel_contains_all_required_sheets_and_reconciles_counts_and_amounts() 
 
 def test_png_is_a_clear_long_image_and_messages_are_ready_to_copy() -> None:
     frame = _sample_frame()
-    png = build_chengdu_opportunity_png(frame, report_date="2026-08-26")
-    image = Image.open(png)
+    bundle = build_report_bundle(frame, report_date="2026-08-26")
+    image = Image.open(bundle.png)
 
     assert image.format == "PNG"
     assert image.width == 1440
     assert image.height >= 700
 
-    concise, full = build_wecom_messages(frame, report_date="2026-08-26")
-    assert "今日商机｜8月26日" in concise
-    assert "今日共纳入 4 条：保险 3 条，工程 1 条" in concise
-    assert "成都市金牛区雇主责任险采购项目（金牛区）" in concise
-    assert "未分区域项目：" in concise
+    concise, full = bundle.concise_text, bundle.full_text
+    assert "今日商机（2026年8月26日）" in concise
+    assert "【已分区域项目｜1条】" in concise
+    assert "【金牛区｜责任险】" in concise
+    assert "成都市金牛区雇主责任险采购项目" in concise
+    assert "【无我司服务点区域｜1条】" in concise
+    assert "【武侯区｜责任险】" in concise
     assert "成都武侯宾馆雇员忠诚险及现金险项目" in concise
-    assert "工程及川内其他地区项目明细见随附 Excel" in concise
+    assert "成都工程 0 条、川内其他商机 2 条，详见附件" in concise
     assert "宜宾市某工程一切险项目" in full
     assert "泸州市江阳区老旧街区改造工程" in full
     assert "截止：2026-09-01 10:00" in full
     assert "原文：https://example.com/engineering-1" in full
+    assert "联系：王老师 028****5678" in full
+    assert "028-12345678" not in full
     assert "待复核" not in concise
     assert "待复核" not in full
+
+    # 成都保险项目按“一项目一图”打包；两条项目必须得到两张不同的高清 PNG。
+    assert bundle.cards_zip is not None
+    assert bundle.cards_zip_bytes == bundle.cards_zip.getvalue()
+    with zipfile.ZipFile(bundle.cards_zip) as archive:
+        card_names = archive.namelist()
+        assert len(card_names) == 2
+        assert len(set(card_names)) == 2
+        assert all(name.endswith(".png") for name in card_names)
+        assert any("金牛区" in name and "雇主责任险" in name for name in card_names)
+        assert any("武侯区" in name and "忠诚险" in name for name in card_names)
+        for name in card_names:
+            card = Image.open(io.BytesIO(archive.read(name)))
+            assert card.format == "PNG"
+            assert card.width == 1440
+            assert card.height >= 1_000
 
 
 def test_empty_data_still_produces_openable_artifacts_and_safe_copy() -> None:
@@ -251,14 +301,21 @@ def test_empty_data_still_produces_openable_artifacts_and_safe_copy() -> None:
 
     workbook = load_workbook(bundle.excel)
     assert workbook.sheetnames == list(SHEET_NAMES)
-    assert workbook["今日商机汇总"]["A5"].value == 0
+    summary = workbook["今日商机汇总"]
+    assert summary.max_column == 5
+    total_row = _find_summary_row(summary, "总计")
+    assert sum(summary.cell(row, 2).value for row in range(4, total_row)) == 0
+    assert sum(summary.cell(row, 4).value for row in range(4, total_row)) == 0
     assert workbook["成都地区（保险）"]["A5"].value == "今日暂无符合条件的记录"
+    assert workbook["采集与判定审计"].sheet_state == "hidden"
 
     image = Image.open(bundle.png)
     assert image.format == "PNG"
     assert image.width == 1440
     assert "今日暂无符合条件的可推送商机" in bundle.concise_text
     assert bundle.concise_text == bundle.full_text
+    with zipfile.ZipFile(bundle.cards_zip) as archive:
+        assert archive.namelist() == ["今日无成都保险商机.txt"]
 
 
 def test_column_aliases_and_chinese_amount_units_are_supported() -> None:

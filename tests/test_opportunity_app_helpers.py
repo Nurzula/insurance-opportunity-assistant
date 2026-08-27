@@ -6,6 +6,8 @@ from opportunity_app import (
     _apply_ai_suggestions,
     _formal_output_blockers,
     _merge_editor_changes,
+    _most_common_report_date,
+    _preserve_member_engineering_rows,
     _records_for_ai,
     _resolve_exact_duplicate_announcements,
     _to_reporting_frame,
@@ -86,6 +88,7 @@ def test_ai_engineering_categories_are_mapped_back_to_editor_values() -> None:
                 "category": "工程直接",
                 "confidence": 0.96,
                 "reason": "正文证据为“市政道路施工”",
+                "source": "ai",
             }
         ],
     )
@@ -217,6 +220,7 @@ def test_ai_high_confidence_without_evidence_anchor_is_not_auto_applied() -> Non
                 "category": "工程直接",
                 "confidence": 0.99,
                 "reason": "正文明确采购大型医疗设备",
+                "source": "ai",
             }
         ],
     )
@@ -240,6 +244,26 @@ def test_public_record_without_full_detail_cannot_enter_formal_output() -> None:
                 "来源平台": "四川省公共资源交易信息网",
                 "正文取证状态": "读取失败",
                 "项目名称": "责任保险采购",
+            }
+        ]
+    )
+    assert not _formal_output_blockers(frame, require_ai=True).empty
+
+
+def test_fallback_include_never_counts_as_completed_ai_review() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-fallback-include",
+                "是否纳入": True,
+                "来源类型": "保险",
+                "险种分类": "责任险",
+                "商机分类": "保险商机",
+                "需人工复核": False,
+                "金额状态": "正常",
+                "AI判定": "include",
+                "AI返回来源": "fallback",
+                "项目名称": "雇主责任险采购",
             }
         ]
     )
@@ -279,3 +303,264 @@ def test_exact_cross_keyword_duplicate_is_merged_after_ai() -> None:
     assert int(result["是否纳入"].sum()) == 1
     assert bool(result.loc[result["记录ID"].eq("保险-1"), "是否纳入"].iloc[0]) is True
     assert "同一官方公告" in result.loc[result["记录ID"].eq("工程-1"), "判定理由"].iloc[0]
+
+
+def test_member_engineering_reliable_ai_exclusion_is_applied() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-member-1",
+                "输入模式": "会员Excel导入",
+                "数据来源": "会员Excel导入",
+                "来源类型": "工程",
+                "项目名称": "某大型医疗设备采购项目",
+                "内容摘要": "本次仅采购大型医疗设备，不含安装、改造或施工。",
+                "标准金额": 30_000_000,
+                "金额状态": "正常",
+                "是否纳入": False,
+                "判定状态": "excluded",
+                "需人工复核": False,
+                "商机分类": "非工程",
+                "险种分类": "工程险",
+            }
+        ]
+    )
+
+    protected = _preserve_member_engineering_rows(frame)
+    assert bool(protected.loc[0, "是否纳入"]) is True
+    assert protected.loc[0, "商机分类"] == "工程项目"
+    assert len(_records_for_ai(protected)) == 1
+
+    reviewed = _apply_ai_suggestions(
+        protected,
+        [
+            {
+                "record_id": "工程-member-1",
+                "decision": "exclude",
+                "category": "无关",
+                "confidence": 0.98,
+                "reason": "正文明确“仅采购大型医疗设备”",
+                "source": "ai",
+            }
+        ],
+    )
+    assert bool(reviewed.loc[0, "是否纳入"]) is False
+    assert reviewed.loc[0, "判定状态"] == "excluded"
+    assert reviewed.loc[0, "商机分类"] == "非工程"
+    assert bool(reviewed.loc[0, "需人工复核"]) is False
+    assert _formal_output_blockers(reviewed, require_ai=True).empty
+
+
+def test_member_engineering_unreliable_ai_exclusion_does_not_silently_delete() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-member-weak",
+                "输入模式": "会员Excel导入",
+                "数据来源": "会员Excel导入",
+                "来源类型": "工程",
+                "项目名称": "某道路改造工程",
+                "内容摘要": "道路及排水工程施工。",
+                "金额状态": "正常",
+                "是否纳入": False,
+                "判定状态": "excluded",
+                "需人工复核": False,
+                "商机分类": "非工程",
+            }
+        ]
+    )
+    protected = _preserve_member_engineering_rows(frame)
+    reviewed = _apply_ai_suggestions(
+        protected,
+        [
+            {
+                "record_id": "工程-member-weak",
+                "decision": "exclude",
+                "category": "无关",
+                "confidence": 0.99,
+                "reason": "没有可核验的正文锚点",
+                "source": "ai",
+            }
+        ],
+    )
+    assert bool(reviewed.loc[0, "是否纳入"]) is True
+    assert reviewed.loc[0, "判定状态"] == "accepted"
+    assert reviewed.loc[0, "商机分类"] == "工程项目"
+    assert reviewed.loc[0, "AI原始判定"] == "exclude"
+    assert reviewed.loc[0, "AI判定"] == "review"
+    assert _formal_output_blockers(reviewed, require_ai=True).empty
+
+
+def test_member_engineering_missing_ai_source_is_not_treated_as_verified() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-member-unknown-source",
+                "输入模式": "会员Excel导入",
+                "数据来源": "会员Excel导入",
+                "来源类型": "工程",
+                "项目名称": "道路改造工程",
+                "内容摘要": "道路改造工程施工。",
+                "金额状态": "正常",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "商机分类": "工程项目",
+            }
+        ]
+    )
+    reviewed = _apply_ai_suggestions(
+        frame,
+        [
+            {
+                "record_id": "工程-member-unknown-source",
+                "decision": "include",
+                "category": "工程直接",
+                "confidence": 0.99,
+                "reason": "正文证据为“道路改造工程施工”",
+            }
+        ],
+    )
+    assert bool(reviewed.loc[0, "需人工复核"]) is True
+    assert reviewed.loc[0, "AI返回来源"] == ""
+    assert not _formal_output_blockers(reviewed, require_ai=True).empty
+
+
+def test_member_engineering_conflicting_exclude_category_is_not_auto_deleted() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-member-conflict",
+                "输入模式": "会员Excel导入",
+                "数据来源": "会员Excel导入",
+                "来源类型": "工程",
+                "项目名称": "道路改造工程",
+                "内容摘要": "道路改造工程施工。",
+                "金额状态": "正常",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "商机分类": "工程项目",
+            }
+        ]
+    )
+    reviewed = _apply_ai_suggestions(
+        frame,
+        [
+            {
+                "record_id": "工程-member-conflict",
+                "decision": "exclude",
+                "category": "前期",
+                "confidence": 0.99,
+                "reason": "正文证据为“道路改造工程施工”",
+                "source": "ai",
+            }
+        ],
+    )
+    assert bool(reviewed.loc[0, "是否纳入"]) is True
+    assert reviewed.loc[0, "AI判定"] == "review"
+    assert reviewed.loc[0, "商机分类"] == "工程项目"
+    assert _formal_output_blockers(reviewed, require_ai=True).empty
+
+
+def test_member_engineering_fallback_is_blocked_from_formal_output() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-member-fallback",
+                "输入模式": "会员Excel导入",
+                "数据来源": "会员Excel导入",
+                "来源类型": "工程",
+                "项目名称": "市政道路工程",
+                "内容摘要": "市政道路工程施工。",
+                "金额状态": "正常",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "商机分类": "工程项目",
+            }
+        ]
+    )
+    reviewed = _apply_ai_suggestions(
+        frame,
+        [
+            {
+                "record_id": "工程-member-fallback",
+                "decision": "review",
+                "category": "待判断",
+                "confidence": 0,
+                "reason": "模型暂不可用",
+                "source": "fallback",
+            }
+        ],
+    )
+    assert bool(reviewed.loc[0, "是否纳入"]) is True
+    assert bool(reviewed.loc[0, "需人工复核"]) is True
+    assert reviewed.loc[0, "AI返回来源"] == "fallback"
+    assert not _formal_output_blockers(reviewed, require_ai=True).empty
+
+
+def test_obsolete_member_engineering_is_never_preserved_or_sent_to_ai() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-member-obsolete",
+                "输入模式": "会员Excel导入",
+                "数据来源": "会员Excel导入",
+                "来源类型": "工程",
+                "项目名称": "某工程（该信息已更新即将删除）",
+                "金额状态": "正常",
+                "是否纳入": False,
+                "判定状态": "excluded",
+                "需人工复核": False,
+                "商机分类": "非工程",
+                "判定理由": "乙方宝标记为已更新即将删除",
+            }
+        ]
+    )
+    result = _preserve_member_engineering_rows(frame)
+    assert bool(result.loc[0, "是否纳入"]) is False
+    assert _records_for_ai(result) == []
+
+    manually_selected = result.copy()
+    manually_selected.loc[0, "是否纳入"] = True
+    manually_selected.loc[0, "AI判定"] = "人工确认"
+    assert not _formal_output_blockers(manually_selected, require_ai=True).empty
+
+
+def test_report_date_defaults_to_source_publication_date() -> None:
+    frame = pd.DataFrame(
+        [
+            {"发布日期": "2026-08-26"},
+            {"发布日期": "2026-08-26"},
+            {"发布日期": "2026-08-25"},
+        ]
+    )
+    assert _most_common_report_date(frame).isoformat() == "2026-08-26"
+
+
+def test_public_engineering_is_not_covered_by_member_preservation_rule() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-public-1",
+                "输入模式": "官方公开来源",
+                "数据来源": "四川省公共资源交易信息网",
+                "来源平台": "四川省公共资源交易信息网",
+                "来源类型": "工程",
+                "项目名称": "大型设备采购项目",
+                "内容摘要": "本次仅采购设备。",
+                "标准金额": 30_000_000,
+                "金额状态": "正常",
+                "是否纳入": False,
+                "判定状态": "excluded",
+                "需人工复核": False,
+                "商机分类": "非工程",
+                "险种分类": "工程险",
+            }
+        ]
+    )
+
+    result = _preserve_member_engineering_rows(frame)
+    assert bool(result.loc[0, "是否纳入"]) is False
+    assert _records_for_ai(result) == []

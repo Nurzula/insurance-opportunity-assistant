@@ -13,11 +13,14 @@ import io
 import os
 import re
 from typing import Any, Iterable
+import zipfile
 
 import pandas as pd
 import streamlit as st
 
 from opportunity_assistant.ai_review import review_opportunities
+from opportunity_assistant.details import enrich_opportunity_details
+from opportunity_assistant.member_enrichment import enrich_member_dataframe
 from opportunity_assistant.core import (
     INSURANCE_TYPES,
     assign_regions,
@@ -35,9 +38,13 @@ from opportunity_assistant.public_sources import (
 
 
 APP_TITLE = "保险商机智能整理与推送助手"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.1"
 DEFAULT_ENGINEERING_MIN_AMOUNT = 10_000_000
 DEFAULT_NO_SERVICE_DISTRICTS = "成华区、锦江区、高新区、天府新区"
+_TERMINAL_NOTICE_PATTERN = re.compile(
+    r"该信息已更新即将删除|已更新即将删除|已失效|信息已删除|公告已删除",
+    re.IGNORECASE,
+)
 
 CORE_EDITABLE_COLUMNS = [
     "是否纳入",
@@ -287,6 +294,71 @@ def _valid_insurance_category(value: Any) -> bool:
     return bool(parts) and all(part in INSURANCE_TYPES for part in parts)
 
 
+def _member_engineering_mask(frame: pd.DataFrame) -> pd.Series:
+    """识别来自公司会员工程导出表的记录。
+
+    会员表是部门老师已经按“工程”关键词取得的正式工作底稿。系统仍会执行
+    金额门槛、异常值、去重和 AI 语义审查，但 AI 只负责分类与提炼要点，
+    不得把金额达标的会员工程记录静默删除。
+    """
+
+    source_type = frame.get(
+        "来源类型", pd.Series("", index=frame.index)
+    ).fillna("").astype(str)
+    input_mode = frame.get(
+        "输入模式", pd.Series("", index=frame.index)
+    ).fillna("").astype(str)
+    data_source = frame.get(
+        "数据来源", pd.Series("", index=frame.index)
+    ).fillna("").astype(str)
+    return source_type.eq("工程") & (
+        input_mode.eq("会员Excel导入")
+        | data_source.str.contains("会员Excel", na=False)
+    )
+
+
+def _terminal_notice_mask(frame: pd.DataFrame) -> pd.Series:
+    """识别乙方宝已经明确标注为失效或即将删除的公告版本。"""
+
+    title = frame.get(
+        "项目名称", pd.Series("", index=frame.index)
+    ).fillna("").astype(str)
+    reason = frame.get(
+        "判定理由", pd.Series("", index=frame.index)
+    ).fillna("").astype(str)
+    return title.str.contains(_TERMINAL_NOTICE_PATTERN, na=False) | reason.str.contains(
+        _TERMINAL_NOTICE_PATTERN, na=False
+    )
+
+
+def _preserve_member_engineering_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """保留会员工程表中金额达标、且未被源平台标为失效的记录。
+
+    这一步只防止标题规则对会员工程底稿造成低置信误删；随后仍须经过 AI
+    正文核验。AI 有充分证据的高置信排除结果可以撤销该临时保留。
+    """
+
+    result = frame.copy()
+    amount_state = result.get(
+        "金额状态", pd.Series("", index=result.index)
+    ).fillna("").astype(str)
+    protected = (
+        _member_engineering_mask(result)
+        & amount_state.eq("正常")
+        & ~_terminal_notice_mask(result)
+    )
+    if not protected.any():
+        return result
+    result.loc[protected, "是否纳入"] = True
+    result.loc[protected, "判定状态"] = "accepted"
+    result.loc[protected, "需人工复核"] = False
+    result.loc[protected, "商机分类"] = "工程项目"
+    result.loc[protected, "判定理由"] = (
+        "会员工程导出记录且金额达到门槛，暂予保留并等待AI正文语义核验"
+    )
+    return result
+
+
 def _formal_output_blockers(
     frame: pd.DataFrame, *, require_ai: bool = False
 ) -> pd.DataFrame:
@@ -319,16 +391,40 @@ def _formal_output_blockers(
     engineering_uncertain = selected.get(
         "商机分类", pd.Series("", index=selected.index)
     ).fillna("").astype(str).isin({"待复核", "非工程"})
+    protected_member_engineering = (
+        _member_engineering_mask(selected)
+        & amount_status_values.eq("正常")
+        & ~_terminal_notice_mask(selected)
+    )
+    engineering_uncertain = engineering_uncertain & ~protected_member_engineering
+    terminal_notice = _terminal_notice_mask(selected)
     if require_ai:
         ai_decision = selected.get(
             "AI判定", pd.Series("", index=selected.index)
         ).fillna("").astype(str)
-        ai_unverified = ~ai_decision.isin({"include", "人工确认"})
+        ai_source = selected.get(
+            "AI返回来源", pd.Series("", index=selected.index)
+        ).fillna("").astype(str).str.lower()
+        manual_verified = ai_decision.eq("人工确认")
+        normal_ai_verified = ai_source.eq("ai") & ai_decision.eq("include")
+        member_ai_verified = (
+            protected_member_engineering
+            & ai_source.eq("ai")
+            & ai_decision.isin({"include", "review"})
+        )
+        ai_unverified = ~(manual_verified | normal_ai_verified | member_ai_verified)
+        selected_mode = selected.get(
+            "输入模式", pd.Series("", index=selected.index)
+        ).fillna("").astype(str)
+        selected_platform = selected.get(
+            "来源平台", pd.Series("", index=selected.index)
+        ).fillna("").astype(str)
+        official_input = selected_mode.eq("官方公开来源") | (
+            selected_mode.str.strip().eq("")
+            & selected_platform.str.contains("公共资源交易", na=False)
+        )
         public_detail_missing = (
-            selected.get("来源平台", pd.Series("", index=selected.index))
-            .fillna("")
-            .astype(str)
-            .str.contains("公共资源交易", na=False)
+            official_input
             & ~selected.get("正文取证状态", pd.Series("", index=selected.index))
             .fillna("")
             .astype(str)
@@ -344,6 +440,7 @@ def _formal_output_blockers(
         | engineering_bad_amount
         | insurance_uncertain
         | engineering_uncertain
+        | terminal_notice
         | ai_unverified
         | public_detail_missing
     ]
@@ -392,9 +489,29 @@ def _to_reporting_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "ai_model": "AI复核模型",
         "ai_reason": "AI理由",
         "announcement_key": "公告去重键",
+        "project_number": "项目编号",
+        "project_location": "项目地点",
+        "procurement_method": "采购方式",
+        "project_scope": "项目内容",
+        "service_term": "服务期限",
+        "qualification": "资格条件",
+        "key_points": "商机关键要点",
+        "detail_status": "详情取证状态",
+        "detail_source_url": "详情来源链接",
     }
     for target, source in mapping.items():
-        result[target] = frame[source] if source in frame.columns else ""
+        source_values = (
+            frame[source]
+            if source in frame.columns
+            else pd.Series("", index=frame.index, dtype=object)
+        )
+        extracted_values = (
+            frame[target]
+            if target in frame.columns
+            else pd.Series("", index=frame.index, dtype=object)
+        )
+        source_text = source_values.fillna("").astype(str).str.strip()
+        result[target] = source_values.where(source_text.ne(""), extracted_values)
     for target, raw_column in (
         ("registration_deadline", "报名截止原文"),
         ("bid_deadline", "投标截止原文"),
@@ -498,11 +615,19 @@ def _editor(frame: pd.DataFrame, source_type: str, key: str) -> pd.DataFrame:
         "标准金额",
         "招标阶段",
         "项目名称",
+        "项目地点",
+        "采购方式",
+        "商机关键要点",
+        "投标截止日期",
+        "招标单位",
+        "招标单位联系人电话",
         "来源平台",
+        "详情取证状态",
         "AI置信度",
         "判定理由",
         "证据摘录",
         "官网查看地址",
+        "会员查看地址",
         "复核意见",
         "推送备注",
     ]
@@ -519,12 +644,20 @@ def _editor(frame: pd.DataFrame, source_type: str, key: str) -> pd.DataFrame:
         "处理状态": st.column_config.TextColumn("处理状态", width="small"),
         "需人工复核": st.column_config.CheckboxColumn("需内部确认", width="small"),
         "项目名称": st.column_config.TextColumn("项目名称", width="large"),
+        "项目地点": st.column_config.TextColumn("项目地点", width="medium"),
+        "采购方式": st.column_config.TextColumn("采购方式", width="small"),
+        "商机关键要点": st.column_config.TextColumn("业务关键要点", width="large"),
+        "投标截止日期": st.column_config.TextColumn("投标截止", width="medium"),
+        "招标单位": st.column_config.TextColumn("招标人/采购人", width="medium"),
+        "招标单位联系人电话": st.column_config.TextColumn("联系电话", width="medium"),
         "标准金额": st.column_config.NumberColumn("招标金额（元）", format="%,.0f"),
         "判定理由": st.column_config.TextColumn("自动判断依据", width="large"),
         "来源平台": st.column_config.TextColumn("信息来源", width="medium"),
         "AI置信度": st.column_config.NumberColumn("AI置信度（0-1）", format="%.2f", width="small"),
         "证据摘录": st.column_config.TextColumn("正文证据", width="large"),
-        "官网查看地址": st.column_config.LinkColumn("官方链接", display_text="打开公告", width="small"),
+        "官网查看地址": st.column_config.LinkColumn("可用详情链接", display_text="打开公告", width="small"),
+        "会员查看地址": st.column_config.LinkColumn("乙方宝会员页", display_text="打开会员页", width="small"),
+        "详情取证状态": st.column_config.TextColumn("详情状态", width="small"),
         "区域归属": st.column_config.TextColumn("区域归属", width="medium"),
         "复核意见": st.column_config.TextColumn("确认意见", width="medium"),
     }
@@ -627,9 +760,13 @@ def _records_for_ai(frame: pd.DataFrame) -> list[dict[str, Any]]:
     ).fillna("").astype(str)
     # 保险误命中很多但每天数量不大，全部交给模型二次语义核验；工程只核验
     # 非低于门槛且并非确定性排除的候选，避免把几百条无关公告逐条送模。
+    member_engineering = _member_engineering_mask(frame)
     candidate_mask = source.eq("保险") | (
-        source.eq("工程") & ~amount_state.eq("低于门槛") & ~status.eq("excluded")
+        source.eq("工程")
+        & ~amount_state.isin({"低于门槛", "异常", "缺失"})
+        & (~status.eq("excluded") | member_engineering)
     )
+    candidate_mask &= ~_terminal_notice_mask(frame)
     candidates = frame[candidate_mask].copy()
     records: list[dict[str, Any]] = []
     for _, row in candidates.iterrows():
@@ -708,26 +845,68 @@ def _apply_ai_suggestions(
         category = str(suggestion.get("category", "")).strip()
         confidence = suggestion.get("confidence", "")
         reason = str(suggestion.get("reason", "")).strip()
+        response_source = str(suggestion.get("source") or "").strip().lower()
         try:
             confidence_number = float(confidence)
         except (TypeError, ValueError):
             confidence_number = 0.0
+        result.at[index, "AI原始判定"] = decision
         result.at[index, "AI判定"] = decision
         result.at[index, "AI置信度"] = confidence_number
         result.at[index, "AI复核模型"] = str(suggestion.get("model", ""))
+        result.at[index, "AI返回来源"] = response_source
         if reason:
             result.at[index, "AI理由"] = reason
 
         evidence_supported = _ai_reason_has_evidence_anchor(reason, row)
-        public_record = "公共资源交易" in str(row.get("来源平台", "") or "")
+        row_mode = str(row.get("输入模式", "") or "").strip()
+        public_record = row_mode == "官方公开来源" or (
+            not row_mode
+            and "公共资源交易" in str(row.get("来源平台", "") or "")
+        )
         detail_ready = (
             not public_record
             or str(row.get("正文取证状态", "") or "").strip() == "完整正文"
         )
-        reliable = confidence_number >= min_confidence and evidence_supported and detail_ready
+        reliable = (
+            response_source == "ai"
+            and confidence_number >= min_confidence
+            and evidence_supported
+            and detail_ready
+        )
         amount_state = str(row.get("金额状态", "") or "").strip()
+        protected_member_engineering = bool(
+            _member_engineering_mask(result.loc[[index]]).iloc[0]
+            and amount_state == "正常"
+            and not _terminal_notice_mask(result.loc[[index]]).iloc[0]
+        )
         amount_gate_ok = row.get("来源类型") != "工程" or amount_state in {"", "正常"}
-        if decision == "include" and reliable and amount_gate_ok:
+        reliable_member_exclusion = (
+            decision == "exclude"
+            and category in {"无关", "非工程"}
+            and reliable
+        )
+        if protected_member_engineering:
+            if reliable_member_exclusion:
+                result.at[index, "是否纳入"] = False
+                result.at[index, "判定状态"] = "excluded"
+                result.at[index, "需人工复核"] = False
+            elif response_source == "ai":
+                # 会员工程底稿以“金额门槛”为部门主口径。模型的 include/review，
+                # 以及没有充分证据的 exclude，都不能静默删掉该记录。
+                result.at[index, "是否纳入"] = True
+                result.at[index, "判定状态"] = "accepted"
+                result.at[index, "需人工复核"] = False
+                if decision == "exclude":
+                    # 原始排除意见保留在 AI原始判定；质量闸门未通过时按
+                    # “证据不足”处理，不能冒充可靠排除，也不能静默删项。
+                    result.at[index, "AI判定"] = "review"
+            else:
+                # 网络/协议回退并不等于完成 AI 审查，保留在内部确认区并阻止群发。
+                result.at[index, "是否纳入"] = True
+                result.at[index, "判定状态"] = "review"
+                result.at[index, "需人工复核"] = True
+        elif decision == "include" and reliable and amount_gate_ok:
             result.at[index, "是否纳入"] = True
             result.at[index, "判定状态"] = "accepted"
             result.at[index, "需人工复核"] = False
@@ -759,6 +938,16 @@ def _apply_ai_suggestions(
                 existing_parts = str(row.get("险种分类", "")).split("、")
                 category = "、".join(dict.fromkeys(existing_parts + category.split("、")))
             result.at[index, target] = category
+        if protected_member_engineering:
+            if reliable_member_exclusion:
+                result.at[index, "商机分类"] = "非工程"
+                result.at[index, "判定理由"] = f"AI正文核验排除：{reason}"
+            else:
+                result.at[index, "商机分类"] = "工程项目"
+                if response_source == "ai":
+                    result.at[index, "判定理由"] = (
+                        "会员工程记录金额达标；AI未提供足以排除该项目的可靠正文证据"
+                    )
         result.at[index, "复核意见"] = (
             f"AI审查（置信度 {confidence_number:.0%}，"
             f"证据锚定{'通过' if evidence_supported else '未通过'}）：{reason}"
@@ -867,6 +1056,143 @@ def _render_sidebar() -> tuple[float, list[str]]:
     return float(min_amount), no_service
 
 
+def _uploaded_date_range(*frames: pd.DataFrame) -> tuple[date, date] | None:
+    """从会员导出表中取得公开官网反查所需的最小日期范围。"""
+
+    values: list[date] = []
+    for frame in frames:
+        for column in ("信息发布时间", "发布日期", "发布时间"):
+            if column not in frame.columns:
+                continue
+            parsed = pd.to_datetime(frame[column], errors="coerce").dropna()
+            values.extend(parsed.dt.date.tolist())
+            if not parsed.empty:
+                break
+    if not values:
+        return None
+    return min(values), max(values)
+
+
+def _empty_detail_stats() -> dict[str, Any]:
+    return {
+        "candidate_count": 0,
+        "attempted_row_count": 0,
+        "attempted_url_count": 0,
+        "success_row_count": 0,
+        "success_url_count": 0,
+        "failure_url_count": 0,
+        "invalid_url_count": 0,
+        "truncated": False,
+    }
+
+
+def _enrich_member_kind_from_official(
+    member_frame: pd.DataFrame,
+    official_frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
+    """先做离线高置信匹配，再只读取真正命中的官方详情页。"""
+
+    if member_frame.empty or official_frame.empty:
+        enriched, match_stats = enrich_member_dataframe(member_frame, official_frame)
+        return enriched, match_stats, _empty_detail_stats()
+
+    preview, _ = enrich_member_dataframe(member_frame, official_frame)
+    official_urls = set(
+        official_frame.get("官网查看地址", pd.Series(dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    matched_urls = set(
+        preview.get("官网查看地址", pd.Series(dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    ) & official_urls
+    candidate_mask = (
+        official_frame.get("官网查看地址", pd.Series("", index=official_frame.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .isin(matched_urls)
+    )
+    if candidate_mask.any():
+        detailed_official, detail_stats = _cached_public_enrich(
+            official_frame,
+            tuple(bool(value) for value in candidate_mask.tolist()),
+            max(1, int(candidate_mask.sum())),
+        )
+    else:
+        detailed_official = official_frame
+        detail_stats = _empty_detail_stats()
+    enriched, match_stats = enrich_member_dataframe(member_frame, detailed_official)
+    return enriched, match_stats, detail_stats
+
+
+def _enrich_member_uploads_with_official(
+    insurance_frame: pd.DataFrame,
+    engineering_frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """用无需登录的四川官方公告补齐会员表，失败时由调用方安全降级。"""
+
+    date_range = _uploaded_date_range(insurance_frame, engineering_frame)
+    if date_range is None:
+        _log("会员Excel缺少可识别发布日期，本次跳过公开官网反查。")
+        return insurance_frame, engineering_frame, {}
+    start_day, end_day = date_range
+    if (end_day - start_day).days > 14:
+        _log("会员Excel日期跨度超过14天，为控制访问量，本次跳过公开官网反查。")
+        return insurance_frame, engineering_frame, {}
+
+    _log(
+        f"正在按 {start_day:%Y-%m-%d} 至 {end_day:%Y-%m-%d} 从四川政府公开平台反查正文。"
+    )
+    lookup_limit = max(
+        300,
+        min(1_200, (len(insurance_frame) + len(engineering_frame)) * 6),
+    )
+    collected = _cached_public_collect(start_day, end_day, lookup_limit)
+    stats = dict(collected.get("stats") or {})
+    if stats.get("has_errors"):
+        errors = [
+            str((stats.get("keywords") or {}).get(keyword, {}).get("error") or "").strip()
+            for keyword in ("险", "工程")
+        ]
+        _log(
+            "官方公开平台本次仅部分返回，已使用可用结果继续匹配："
+            + "；".join(error for error in errors if error)
+        )
+        # 错误结果不保留20分钟，用户再次点击处理即可重新请求官网。
+        _cached_public_collect.clear()
+    insurance_official = collected.get("insurance", pd.DataFrame())
+    engineering_official = collected.get("engineering", pd.DataFrame())
+    insurance_enriched, insurance_match, insurance_detail = (
+        _enrich_member_kind_from_official(insurance_frame, insurance_official)
+    )
+    engineering_enriched, engineering_match, engineering_detail = (
+        _enrich_member_kind_from_official(engineering_frame, engineering_official)
+    )
+    stats["member_match"] = {
+        "险": insurance_match,
+        "工程": engineering_match,
+    }
+    stats["detail"] = {
+        "险": insurance_detail,
+        "工程": engineering_detail,
+    }
+    completion_label = "公开官网反查部分完成" if stats.get("has_errors") else "公开官网反查完成"
+    _log(
+        "{}：保险匹配 {}/{} 条、工程匹配 {}/{} 条；只对命中项读取正文。".format(
+            completion_label,
+            insurance_match.get("matched_rows", 0),
+            insurance_match.get("member_rows", len(insurance_frame)),
+            engineering_match.get("matched_rows", 0),
+            engineering_match.get("member_rows", len(engineering_frame)),
+        )
+    )
+    return insurance_enriched, engineering_enriched, stats
+
+
 def _process_uploads(
     insurance_file: Any,
     engineering_file: Any,
@@ -877,18 +1203,25 @@ def _process_uploads(
     engineering_bytes = engineering_file.getvalue()
     config_signature = (
         f"|{min_amount}|{','.join(no_service)}|"
-        f"{_setting('DEEPSEEK_MODEL', 'deepseek-v4-flash')}|v2"
+        f"{_setting('DEEPSEEK_MODEL', 'deepseek-v4-flash')}|v4"
     ).encode("utf-8")
     source_hash = hashlib.sha256(
         insurance_bytes + b"|" + engineering_bytes + config_signature
     ).hexdigest()
 
+    previous_source_stats = dict(st.session_state.get("opp_source_stats") or {})
     if (
         source_hash == st.session_state.get("opp_source_hash")
         and st.session_state.get("opp_results") is not None
+        and not previous_source_stats.get("has_errors")
     ):
         _log("检测到相同文件和相同规则配置，已复用本次会话中的审查结果。")
         return
+    if (
+        source_hash == st.session_state.get("opp_source_hash")
+        and previous_source_stats.get("has_errors")
+    ):
+        _log("检测到上次官网补全不完整，本次将重新请求公开来源。")
 
     st.session_state.opp_logs = []
     _log("开始校验两份乙方宝导出文件。")
@@ -904,6 +1237,17 @@ def _process_uploads(
     elif first_kind not in {"保险", ""} or second_kind not in {"工程", ""}:
         raise ValueError("文件关键词与上传位置不匹配，请分别上传关键词“险”和“工程”的乙方宝导出表。")
 
+    source_stats: dict[str, Any] = {}
+    try:
+        first, second, source_stats = _enrich_member_uploads_with_official(first, second)
+    except Exception as exc:
+        # 公开官网补全只是增强层；其短时不可用不能阻断会员表的日常推送。
+        _log(f"公开官网补全暂不可用，继续使用会员Excel原始字段：{type(exc).__name__}。")
+        source_stats = {
+            "has_errors": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
     _finalize_input_frames(
         first,
         second,
@@ -911,6 +1255,8 @@ def _process_uploads(
         no_service=no_service,
         source_hash=source_hash,
         input_mode="会员Excel导入",
+        source_stats=source_stats,
+        report_date_hint=None,
     )
 
 
@@ -936,6 +1282,9 @@ def _finalize_input_frames(
     insurance = _add_record_ids(insurance)
     engineering = _add_record_ids(engineering)
     combined = pd.concat([insurance, engineering], ignore_index=True, sort=False)
+    combined["输入模式"] = input_mode
+    if input_mode == "会员Excel导入":
+        combined = _preserve_member_engineering_rows(combined)
     if "证据摘录" in combined.columns:
         empty_evidence = combined["证据摘录"].fillna("").astype(str).str.strip().eq("")
         amount_evidence = combined.get(
@@ -969,6 +1318,25 @@ def _finalize_input_frames(
 
     combined = _run_mandatory_ai_review(combined)
     combined = _resolve_exact_duplicate_announcements(combined)
+    combined = enrich_opportunity_details(combined)
+    detail_columns = {
+        "project_number": "项目编号",
+        "procurement_method": "采购方式",
+        "project_location": "项目地点",
+        "project_scope": "项目内容",
+        "service_term": "服务期限",
+        "qualification": "资格条件",
+        "key_points": "商机关键要点",
+        "detail_status": "详情取证状态",
+        "detail_source_url": "详情来源链接",
+    }
+    for extracted_column, chinese_column in detail_columns.items():
+        if chinese_column not in combined.columns:
+            combined[chinese_column] = ""
+        current = combined[chinese_column].fillna("").astype(str).str.strip()
+        combined.loc[current.eq(""), chinese_column] = combined.loc[
+            current.eq(""), extracted_column
+        ]
     ai_selected = int(_selected_mask(combined).sum())
     ai_pending = int(
         combined.get(
@@ -1108,8 +1476,12 @@ def _render_source_coverage() -> None:
     stats = dict(st.session_state.opp_source_stats or {})
     keywords = stats.get("keywords") or {}
     if not keywords:
+        if stats.get("has_errors"):
+            st.warning("本次官方公开平台未完整返回；会员表处理已完成，再次点击处理可重试官网补全。")
         return
     with st.expander("🌐 官方公开源采集完整性", expanded=False):
+        if stats.get("has_errors"):
+            st.warning("本次官方公开平台仅部分返回；会员表处理仍已完成，可再次点击处理重试官网补全。")
         rows: list[dict[str, Any]] = []
         details = stats.get("detail") or {}
         for keyword in ("险", "工程"):
@@ -1131,6 +1503,24 @@ def _render_source_coverage() -> None:
                 }
             )
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        member_match = stats.get("member_match") or {}
+        if member_match:
+            match_rows: list[dict[str, Any]] = []
+            for keyword in ("险", "工程"):
+                item = dict(member_match.get(keyword) or {})
+                member_rows = int(item.get("member_rows", 0) or 0)
+                matched_rows = int(item.get("matched_rows", 0) or 0)
+                match_rows.append(
+                    {
+                        "会员表": keyword,
+                        "会员记录": member_rows,
+                        "匹配到官方公告": matched_rows,
+                        "未匹配": int(item.get("unmatched_rows", 0) or 0),
+                        "官方补全率": f"{(matched_rows / member_rows):.1%}" if member_rows else "—",
+                    }
+                )
+            st.markdown("**会员表与官方公开公告交叉补全**")
+            st.dataframe(pd.DataFrame(match_rows), hide_index=True, width="stretch")
         st.caption(
             "这里衡量的是本次官方检索是否完整，不等于乙方宝商业聚合覆盖率。"
             "只有用同一天乙方宝导出表做对照，才能计算两者的真实交集与覆盖率。"
@@ -1194,7 +1584,7 @@ def _render_outputs(frame: pd.DataFrame) -> None:
         value=st.session_state.opp_report_date or date.today(),
         key="opp_date_input",
     )
-    if st.button("✨ 一键生成群文案、成都PNG和Excel", type="primary", width="stretch"):
+    if st.button("✨ 一键生成群文案、重点信息图和Excel", type="primary", width="stretch"):
         selected_count = int(_selected_mask(frame).sum())
         blockers = _formal_output_blockers(frame, require_ai=True)
         if selected_count == 0:
@@ -1226,9 +1616,12 @@ def _render_outputs(frame: pd.DataFrame) -> None:
     full_text = getattr(bundle, "full_text", "")
     excel = getattr(bundle, "excel", None)
     png = getattr(bundle, "png", None)
+    cards_zip = getattr(bundle, "cards_zip", None)
     date_tag = (st.session_state.opp_report_date or date.today()).strftime("%Y%m%d")
 
-    text_tab, preview_tab = st.tabs(["群发文字", "成都图片预览"])
+    text_tab, preview_tab, card_tab = st.tabs(
+        ["群发文字", "成都保险汇总图", "单项目重点卡"]
+    )
     with text_tab:
         version = st.radio("文案版本", ["简洁版", "完整版"], horizontal=True, key="message_version")
         chosen_text = concise_text if version == "简洁版" else full_text
@@ -1243,9 +1636,29 @@ def _render_outputs(frame: pd.DataFrame) -> None:
     with preview_tab:
         if png is not None:
             png_bytes = png.getvalue() if hasattr(png, "getvalue") else bytes(png)
-            st.image(png_bytes, caption="成都地区商机长图", width="stretch")
+            st.image(png_bytes, caption="成都保险商机重点信息汇总图", width="stretch")
+    with card_tab:
+        if cards_zip is None:
+            st.info("本次没有可生成的成都保险项目重点卡。")
+        else:
+            cards_bytes = cards_zip.getvalue() if hasattr(cards_zip, "getvalue") else bytes(cards_zip)
+            with zipfile.ZipFile(io.BytesIO(cards_bytes)) as archive:
+                card_names = [name for name in archive.namelist() if name.lower().endswith(".png")]
+                if not card_names:
+                    st.info("本次没有成都保险项目重点卡。")
+                else:
+                    chosen_card = st.selectbox(
+                        "选择项目预览",
+                        card_names,
+                        format_func=lambda value: value.rsplit("/", 1)[-1].removesuffix(".png"),
+                    )
+                    st.image(
+                        archive.read(chosen_card),
+                        caption="一项目一张高清重点卡（电话已脱敏，完整联系方式见Excel）",
+                        width="stretch",
+                    )
 
-    download_cols = st.columns(2)
+    download_cols = st.columns(3)
     if excel is not None:
         excel_bytes = excel.getvalue() if hasattr(excel, "getvalue") else bytes(excel)
         download_cols[0].download_button(
@@ -1264,6 +1677,16 @@ def _render_outputs(frame: pd.DataFrame) -> None:
             mime="image/png",
             width="stretch",
         )
+    if cards_zip is not None:
+        cards_bytes = cards_zip.getvalue() if hasattr(cards_zip, "getvalue") else bytes(cards_zip)
+        download_cols[2].download_button(
+            "🗂️ 下载一项目一图ZIP",
+            data=cards_bytes,
+            file_name=f"{date_tag}-成都保险商机重点卡.zip",
+            mime="application/zip",
+            width="stretch",
+            help="每条成都保险商机单独一张高清要点图，适合直接发企业微信群。",
+        )
 
 
 def main() -> None:
@@ -1277,13 +1700,13 @@ def main() -> None:
         f"""
         <div class="opp-hero">
           <h1>📡 {APP_TITLE}</h1>
-          <p>会员Excel与政府公开来源双模式，一次完成正文取证、AI语义筛选、区域分配、群文案、成都长图与专业Excel。</p>
+          <p>会员Excel与政府公开来源双模式，一次完成正文取证、AI语义审查、区域分配、群文案、项目重点图与专业Excel。</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.markdown(
-        "<div class='opp-note'>🔎 AI为必经审查层：规则先筛掉明显无关项，DeepSeek再批量核验候选。公开模式只读取无需登录的四川省公共资源交易官方信息，不访问乙方宝会员详情。</div>",
+        "<div class='opp-note'>🔎 AI为必经审查层：保险商机由规则与DeepSeek共同筛选；会员工程表按1000万元门槛完整保留，AI负责语义核验与要点提炼。系统只从无需登录的政府官网补全正文，不绕过乙方宝会员权限。</div>",
         unsafe_allow_html=True,
     )
 

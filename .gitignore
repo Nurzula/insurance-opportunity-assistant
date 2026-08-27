@@ -10,3 +10,4 @@ venv/
 *.xlsx
 *.xls
 .codex_tmp/
+outputs/

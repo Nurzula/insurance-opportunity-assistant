@@ -24,6 +24,7 @@ import io
 import math
 import os
 import re
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -46,6 +47,7 @@ __all__ = [
     "build_excel_report",
     "build_chengdu_opportunity_png",
     "build_chengdu_png",
+    "build_opportunity_cards_zip",
     "build_wecom_text",
     "build_wecom_messages",
     "build_report_bundle",
@@ -86,6 +88,15 @@ REQUIRED_COLUMNS: tuple[str, ...] = (
     "ai_model",
     "ai_reason",
     "announcement_key",
+    "project_number",
+    "project_location",
+    "procurement_method",
+    "project_scope",
+    "service_term",
+    "qualification",
+    "key_points",
+    "detail_status",
+    "detail_source_url",
 )
 
 
@@ -139,6 +150,27 @@ COLUMN_ALIASES: Mapping[str, tuple[str, ...]] = {
     "ai_model": ("ai_model", "AI复核模型"),
     "ai_reason": ("ai_reason", "AI理由"),
     "announcement_key": ("announcement_key", "公告去重键"),
+    "project_number": ("project_number", "项目编号", "采购编号", "招标编号"),
+    "project_location": ("project_location", "项目地点", "建设地点", "服务地点"),
+    "procurement_method": ("procurement_method", "采购方式", "招标方式"),
+    "project_scope": (
+        "project_scope",
+        "项目内容",
+        "采购内容",
+        "建设内容",
+        "招标范围",
+        "项目概况",
+    ),
+    "service_term": ("service_term", "服务期限", "保险期限", "计划工期", "工期"),
+    "qualification": ("qualification", "资格条件", "投标人资格", "供应商资格"),
+    "key_points": ("key_points", "商机关键要点", "关键要点", "AI要点"),
+    "detail_status": ("detail_status", "详情取证状态", "正文取证状态"),
+    "detail_source_url": (
+        "detail_source_url",
+        "详情来源链接",
+        "官方原文",
+        "官方链接",
+    ),
 }
 
 
@@ -169,20 +201,16 @@ DETAIL_COLUMNS: tuple[tuple[str, str], ...] = (
 # 完整的判定依据、区域分组、唯一键等仍保留在“未分区域/筛除”审计页。
 BUSINESS_DETAIL_COLUMNS: tuple[tuple[str, str], ...] = (
     ("_sequence", "序号"),
-    ("category", "分类/险种"),
+    ("_project_location", "项目地区"),
+    ("service_region", "分配区域"),
+    ("category", "险种/项目类型"),
     ("project_name", "项目名称"),
-    ("publish_date", "发布日期"),
     ("amount", "招标金额（元）"),
-    ("city", "地市"),
-    ("district", "区县"),
-    ("service_region", "服务区域"),
-    ("stage", "项目阶段"),
     ("deadline", "截止时间"),
     ("tenderer", "招标人/采购人"),
+    ("_key_points", "商机关键要点"),
     ("contact", "联系人/联系方式"),
-    ("agent", "代理机构"),
     ("url", "原文链接"),
-    ("_remarks", "备注"),
 )
 
 
@@ -250,13 +278,13 @@ DEFAULT_REGION_ORDER: tuple[str, ...] = (
     "金堂县",
     "大邑县",
     "蒲江县",
-    "新津区",
+    # 部门现有汇总模板仍使用“新津县”，这里保持业务侧既有展示口径。
+    "新津县",
     "都江堰市",
     "彭州市",
     "邛崃市",
     "崇州市",
     "未明确",
-    "无区域类",
     "川内其他地区",
 )
 
@@ -286,18 +314,25 @@ THIN_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN
 
 @dataclass(frozen=True)
 class ReportBundle:
-    """一次生成的四项交付物。"""
+    """一次生成的群发文案、汇总图、重点卡片与 Excel。"""
 
     excel: io.BytesIO
     png: io.BytesIO
     concise_text: str
     full_text: str
+    cards_zip: io.BytesIO | None = None
 
     @property
     def excel_bytes(self) -> bytes:
         """返回便于 ``st.download_button`` 使用的二进制内容。"""
 
         return self.excel.getvalue()
+
+    @property
+    def cards_zip_bytes(self) -> bytes:
+        """返回一项目一图的 ZIP；无卡片时返回空字节。"""
+
+        return self.cards_zip.getvalue() if self.cards_zip is not None else b""
 
     @property
     def png_bytes(self) -> bytes:
@@ -535,6 +570,39 @@ def normalize_report_dataframe(data: pd.DataFrame | Iterable[Mapping[str, Any]] 
         for region, city in zip(normalized["region_group"], normalized["city"])
     ]
     normalized["project_name"] = normalized["project_name"].replace("", "（未命名项目）")
+    normalized["project_location"] = [
+        location or district or city
+        for location, district, city in zip(
+            normalized["project_location"],
+            normalized["district"],
+            normalized["city"],
+        )
+    ]
+    normalized["detail_source_url"] = [
+        detail_url or url
+        for detail_url, url in zip(normalized["detail_source_url"], normalized["url"])
+    ]
+
+    # 正文结构化字段可能来自官方网页提取，也可能仅有乙方宝 Excel 基础字段。
+    # 没有正文时只组合已有事实，不推测资格、期限或采购内容。
+    generated_points: list[str] = []
+    for _, row in normalized.iterrows():
+        if row["key_points"]:
+            generated_points.append(row["key_points"][:800])
+            continue
+        parts: list[str] = []
+        for label, field in (
+            ("项目编号", "project_number"),
+            ("采购方式", "procurement_method"),
+            ("项目内容", "project_scope"),
+            ("服务期/工期", "service_term"),
+            ("资格条件", "qualification"),
+        ):
+            value = _clean_text(row[field])
+            if value:
+                parts.append(f"{label}：{value}")
+        generated_points.append("；".join(parts)[:800])
+    normalized["key_points"] = generated_points
 
     # 保留数据的原始顺序，仅重置行号，便于与上游处理日志对照。
     return normalized.reset_index(drop=True)
@@ -734,112 +802,172 @@ def _apply_sheet_defaults(ws: Any, *, landscape: bool = True) -> None:
     ws.sheet_properties.outlinePr.summaryBelow = True
 
 
+def _summary_region_label(row: pd.Series) -> str:
+    """汇总按项目地理位置统计，不能被“无服务点”的分配标签覆盖。"""
+
+    region_group = _clean_text(row.get("region_group"))
+    district = _clean_text(row.get("district"))
+    city = _clean_text(row.get("city"))
+    if region_group == "成都地区" or "成都" in city:
+        aliases = {
+            "成都高新区": "高新区",
+            "高新南区": "高新区",
+            "高新西区": "高新区",
+            "四川天府新区": "天府新区",
+            "成都天府新区": "天府新区",
+            "天府新区成都直管区": "天府新区",
+            "新津区": "新津县",
+        }
+        return aliases.get(district, district) or "未明确"
+    if region_group == "川内其他地区" or city:
+        return "川内其他地区"
+    return "未明确"
+
+
 def _write_summary_sheet(ws: Any, frame: pd.DataFrame, report_day: date) -> None:
+    """按部门现用五列表重做汇总，适合一屏截图和手机阅读。"""
+
     selected = frame[frame["selected"]].copy()
-    selected["_allocation"] = selected.apply(_allocation_label, axis=1)
-    insurance = selected[selected["business_type"] == "保险"]
-    engineering = selected[selected["business_type"] == "工程"]
-    review_count = int(_review_mask(selected).sum())
+    selected["_summary_region"] = selected.apply(_summary_region_label, axis=1)
 
-    _style_title(ws, f"{_date_cn(report_day)}商机信息情况", "保险与工程商机区域分配总览", 12)
+    ws.merge_cells("A1:E1")
+    title = ws["A1"]
+    title.value = f"{_date_cn(report_day)}商机信息情况"
+    title.font = Font(name="Microsoft YaHei", size=20, bold=True, color="000000")
+    title.alignment = Alignment(horizontal="center", vertical="center")
+    title.fill = PatternFill("solid", fgColor="FFFFFF")
+    ws.row_dimensions[1].height = 38
 
-    kpis = (
-        ("推送商机", len(selected), BLUE),
-        ("保险商机", len(insurance), BLUE),
-        ("保险金额", _money_sum(insurance["amount"]), GREEN),
-        ("工程商机", len(engineering), ORANGE),
-        ("工程金额", _money_sum(engineering["amount"]), ORANGE),
-        ("未分区域", review_count, GOLD),
+    ws.merge_cells("A2:A3")
+    ws.merge_cells("B2:C2")
+    ws.merge_cells("D2:E2")
+    ws["A2"] = "区域"
+    ws["B2"] = "保险类"
+    ws["D2"] = "工程类"
+    for cell_ref, value in (("B3", "项目数"), ("C3", "招标金额（元）"), ("D3", "项目数"), ("E3", "招标金额（元）")):
+        ws[cell_ref] = value
+
+    summary_side = Side(style="thin", color="4A4A4A")
+    summary_border = Border(
+        left=summary_side,
+        right=summary_side,
+        top=summary_side,
+        bottom=summary_side,
     )
-    for index, (label, value, color) in enumerate(kpis):
-        column = index * 2 + 1
-        label_cell = ws.cell(4, column, label)
-        value_cell = ws.cell(5, column, value)
-        ws.merge_cells(start_row=4, start_column=column, end_row=4, end_column=column + 1)
-        ws.merge_cells(start_row=5, start_column=column, end_row=5, end_column=column + 1)
-        _set_cell_style(label_cell, fill=color, font_color=WHITE, bold=True, size=10, horizontal="center")
-        _set_cell_style(value_cell, fill=WHITE, font_color=color, bold=True, size=16, horizontal="center")
-        if "金额" in label:
-            value_cell.number_format = '¥#,##0.00'
-    ws.row_dimensions[4].height = 23
-    ws.row_dimensions[5].height = 34
+    for row in ws.iter_rows(min_row=2, max_row=3, min_col=1, max_col=5):
+        for cell in row:
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.font = Font(name="Microsoft YaHei", size=13, bold=True, color="000000")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = summary_border
+    ws.row_dimensions[2].height = 29
+    ws.row_dimensions[3].height = 29
 
-    headers = (
-        "区域",
-        "保险项目数",
-        "保险招标金额（元）",
-        "工程项目数",
-        "工程招标金额（元）",
-        "合计项目数",
-        "合计金额（元）",
-    )
-    header_row = 8
-    for col, header in enumerate(headers, 1):
-        cell = ws.cell(header_row, col, header)
-        _set_cell_style(cell, fill=NAVY, font_color=WHITE, bold=True, horizontal="center")
-    ws.row_dimensions[header_row].height = 30
-
-    actual_labels = [_clean_text(value) for value in selected["_allocation"].unique() if _clean_text(value)]
+    actual_labels = [
+        _clean_text(value)
+        for value in selected["_summary_region"].unique()
+        if _clean_text(value)
+    ]
     extra_labels = sorted(label for label in actual_labels if label not in DEFAULT_REGION_ORDER)
     region_labels = list(DEFAULT_REGION_ORDER) + extra_labels
-
-    first_data_row = header_row + 1
+    first_data_row = 4
     for row_index, label in enumerate(region_labels, first_data_row):
-        group = selected[selected["_allocation"] == label]
+        group = selected[selected["_summary_region"] == label]
         ins = group[group["business_type"] == "保险"]
         eng = group[group["business_type"] == "工程"]
         values: tuple[Any, ...] = (
             label,
-            len(ins),
+            int(len(ins)),
             _money_sum(ins["amount"]),
-            len(eng),
+            int(len(eng)),
             _money_sum(eng["amount"]),
-            f"=SUM(B{row_index},D{row_index})",
-            f"=SUM(C{row_index},E{row_index})",
         )
         for col, value in enumerate(values, 1):
             cell = ws.cell(row_index, col, value)
-            fill = LIGHT_BLUE if row_index % 2 else WHITE
-            if label in {"未明确", "无区域类"}:
-                fill = LIGHT_GOLD
-            _set_cell_style(cell, fill=fill, horizontal="center" if col != 1 else "left")
-            if col in {3, 5, 7}:
-                cell.number_format = '#,##0.00;[Red]-#,##0.00;0'
+            cell.fill = PatternFill("solid", fgColor="FFFFFF")
+            cell.font = Font(name="Microsoft YaHei", size=11, color="000000")
+            cell.alignment = Alignment(
+                horizontal="center" if col in {1, 2, 4} else "right",
+                vertical="center",
+            )
+            cell.border = summary_border
+            if col in {3, 5}:
+                cell.number_format = '#,##0.##;[Red]-#,##0.##;0'
+        ws.row_dimensions[row_index].height = 23
 
     total_row = first_data_row + len(region_labels)
     ws.cell(total_row, 1, "总计")
-    for col in range(2, 8):
+    for col in range(2, 6):
         letter = get_column_letter(col)
         ws.cell(total_row, col, f"=SUM({letter}{first_data_row}:{letter}{total_row - 1})")
-    for col in range(1, 8):
+    for col in range(1, 6):
         cell = ws.cell(total_row, col)
-        _set_cell_style(cell, fill=NAVY, font_color=WHITE, bold=True, horizontal="center")
-        if col in {3, 5, 7}:
-            cell.number_format = '#,##0.00;[Red]-#,##0.00;0'
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        cell.font = Font(name="Microsoft YaHei", size=12, bold=True, color="000000")
+        cell.alignment = Alignment(
+            horizontal="center" if col in {1, 2, 4} else "right",
+            vertical="center",
+        )
+        cell.border = summary_border
+        if col in {3, 5}:
+            cell.number_format = '#,##0.##;[Red]-#,##0.##;0'
     ws.row_dimensions[total_row].height = 26
 
-    note_row = total_row + 2
-    ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row + 1, end_column=7)
-    note = ws.cell(
-        note_row,
-        1,
-        "说明：金额均按元汇总；未披露金额不按 0 元伪造，仅不计入金额合计。"
-        "“无区域类/未明确”项目请在推送前完成内部确认。",
-    )
-    _set_cell_style(note, fill=LIGHT_GOLD, font_color=TEXT, size=10, vertical="top")
-    ws.row_dimensions[note_row].height = 35
+    note_row = total_row + 1
+    ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=5)
+    note = ws.cell(note_row, 1, "具体招标信息详见子表")
+    note.font = Font(name="Microsoft YaHei", size=11, color="333333")
+    note.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[note_row].height = 22
 
-    widths = {"A": 20, "B": 13, "C": 22, "D": 13, "E": 22, "F": 13, "G": 22}
-    for column, width in widths.items():
+    for column, width in {"A": 18, "B": 12, "C": 20, "D": 12, "E": 20}.items():
         ws.column_dimensions[column].width = width
-    # KPI 区域使用到 H:L，适度留白。
-    for column in "HIJKL":
-        ws.column_dimensions[column].width = 12
-    ws.freeze_panes = "A9"
-    ws.auto_filter.ref = f"A{header_row}:G{total_row - 1}"
-    ws.print_title_rows = f"1:{header_row}"
-    _apply_sheet_defaults(ws)
-    ws.freeze_panes = "A9"
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A4"
+    ws.print_title_rows = "1:3"
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.sheet_view.zoomScale = 100
+
+
+def _project_location_text(record: pd.Series) -> str:
+    explicit = _clean_text(record.get("project_location"))
+    city = _clean_text(record.get("city"))
+    district = _clean_text(record.get("district"))
+    if explicit and explicit not in {city, district}:
+        return explicit
+    if city and district and district not in city:
+        return f"{city}-{district}"
+    return district or city or explicit or "未披露"
+
+
+def _business_key_points(record: pd.Series) -> str:
+    """把已取证字段压成业务老师可快速扫描的一格，不输出内部模型术语。"""
+
+    points = _clean_text(record.get("key_points"))
+    if points:
+        return points[:800]
+    parts: list[str] = []
+    for label, field in (
+        ("项目编号", "project_number"),
+        ("采购方式", "procurement_method"),
+        ("项目内容", "project_scope"),
+        ("服务期/工期", "service_term"),
+        ("资格条件", "qualification"),
+    ):
+        value = _clean_text(record.get(field))
+        if value:
+            parts.append(f"{label}：{value}")
+    stage = _clean_text(record.get("stage"))
+    agent = _clean_text(record.get("agent"))
+    if stage:
+        parts.append(f"阶段：{stage}")
+    if agent:
+        parts.append(f"代理：{agent}")
+    return "；".join(parts)[:800] or "基础信息见本行，详情请打开原文链接。"
 
 
 def _write_detail_sheet(ws: Any, title: str, frame: pd.DataFrame, report_day: date) -> None:
@@ -884,6 +1012,10 @@ def _write_detail_sheet(ws: Any, title: str, frame: pd.DataFrame, report_day: da
             for output_col, (field, _) in enumerate(columns, 1):
                 if field == "_sequence":
                     value: Any = sequence
+                elif field == "_project_location":
+                    value = _project_location_text(record)
+                elif field == "_key_points":
+                    value = _business_key_points(record)
                 elif field == "_remarks":
                     # 正式分发页只展示业务老师主动填写的推送备注；
                     # 自动判定依据和数据质量信息保留在内部审计页。
@@ -917,6 +1049,7 @@ def _write_detail_sheet(ws: Any, title: str, frame: pd.DataFrame, report_day: da
 
                 alignment = "center" if field in {
                     "_sequence",
+                    "_project_location",
                     "selected",
                     "business_type",
                     "category",
@@ -941,26 +1074,22 @@ def _write_detail_sheet(ws: Any, title: str, frame: pd.DataFrame, report_day: da
                 elif field == "url" and _clean_text(value).startswith(("http://", "https://")):
                     cell.hyperlink = _clean_text(value)
                     cell.font = Font(name="Microsoft YaHei", size=9, color="0563C1", underline="single")
-            ws.row_dimensions[output_row].height = 50
+            ws.row_dimensions[output_row].height = 78 if compact else 50
         last_row = header_row + len(frame)
 
     if compact:
         widths = {
             1: 8,
-            2: 16,
-            3: 48,
-            4: 15,
-            5: 18,
-            6: 13,
-            7: 13,
-            8: 16,
-            9: 15,
-            10: 23,
-            11: 26,
-            12: 24,
-            13: 25,
-            14: 34,
-            15: 36,
+            2: 18,
+            3: 15,
+            4: 18,
+            5: 48,
+            6: 19,
+            7: 24,
+            8: 28,
+            9: 54,
+            10: 30,
+            11: 34,
         }
     elif title == "采集与判定审计":
         widths = {
@@ -1009,10 +1138,10 @@ def _write_detail_sheet(ws: Any, title: str, frame: pd.DataFrame, report_day: da
     for index, width in widths.items():
         ws.column_dimensions[get_column_letter(index)].width = width
     ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(columns))}{max(header_row, last_row)}"
-    ws.freeze_panes = "D5" if compact else "E5"
+    ws.freeze_panes = "E5" if compact else "E5"
     ws.print_title_rows = "1:4"
     _apply_sheet_defaults(ws)
-    ws.freeze_panes = "D5" if compact else "E5"
+    ws.freeze_panes = "E5"
 
 
 def _normalise_logs(
@@ -1131,6 +1260,12 @@ def build_opportunity_excel(
         _write_detail_sheet(sheet, sheet_name, partitions[sheet_name], report_day)
     log_sheet = workbook.create_sheet("处理日志")
     _write_log_sheet(log_sheet, frame, processing_log, report_day)
+
+    # 群发工作簿打开时只呈现老师需要的汇总和四个业务子表；内部追溯页仍保留，
+    # 但默认隐藏，避免领导/业务人员首先看到模型、筛除和质量术语。
+    for internal_name in ("未分区域项目", "筛除记录", "采集与判定审计", "处理日志"):
+        workbook[internal_name].sheet_state = "hidden"
+    workbook.active = 0
 
     output = io.BytesIO()
     workbook.save(output)
@@ -1264,6 +1399,28 @@ def _safe_image_text(value: Any) -> str:
     return text.replace("\u200b", "").replace("\ufeff", "")
 
 
+def _mask_contact_for_image(value: Any) -> str:
+    """群发图片默认遮蔽电话中段；Excel 内部明细仍保留源文件原值。"""
+
+    text = _safe_image_text(value)
+    if not text:
+        return ""
+
+    def mask(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) < 7:
+            return raw
+        return f"{digits[:3]}****{digits[-4:]}"
+
+    phone_pattern = re.compile(
+        r"(?<!\d)(?:\+?86[- ]?)?(?:1\d{10}|0\d{2,3}[- ]?\d{7,8})(?!\d)"
+    )
+    text = phone_pattern.sub(mask, text)
+    # 会员页有时只给不带区号的 7/8 位座机号，也按联系方式脱敏。
+    return re.sub(r"(?<!\d)\d{7,12}(?!\d)", mask, text)
+
+
 def build_chengdu_opportunity_png(
     data: pd.DataFrame | Iterable[Mapping[str, Any]] | None,
     *,
@@ -1275,14 +1432,19 @@ def build_chengdu_opportunity_png(
 
     frame = normalize_report_dataframe(data)
     report_day = _report_date(report_date)
+    # 群里的文字派单以成都保险商机为主；工程与川内其他项目留在 Excel，
+    # 避免把几十条记录压成一张在手机端无法阅读的超长图。
     chengdu = frame[
-        frame["selected"] & (frame["region_group"] == "成都地区")
+        frame["selected"]
+        & (frame["region_group"] == "成都地区")
+        & (frame["business_type"] == "保险")
     ].copy()
     if not chengdu.empty:
         chengdu["_allocation"] = chengdu.apply(_allocation_label, axis=1)
+        chengdu["_review_order"] = _review_mask(chengdu).astype(int)
         chengdu["_type_order"] = chengdu["business_type"].map({"保险": 0, "工程": 1}).fillna(2)
         chengdu = chengdu.sort_values(
-            by=["_allocation", "_type_order", "publish_date", "project_name"],
+            by=["_review_order", "_allocation", "_type_order", "publish_date", "project_name"],
             kind="stable",
         )
 
@@ -1300,7 +1462,7 @@ def build_chengdu_opportunity_png(
     # 先用临时画布计算每张卡片高度，避免长标题被截断。
     probe = Image.new("RGB", (width, 200), "white")
     probe_draw = ImageDraw.Draw(probe)
-    cards: list[tuple[pd.Series, list[str], list[str], int]] = []
+    cards: list[tuple[pd.Series, list[str], list[str], list[str], list[str], int]] = []
     for _, record in chengdu.iterrows():
         title_lines = _wrap_for_image(probe_draw, record["project_name"], name_font, inner_width - 72)
         tenderer_lines = _wrap_for_image(
@@ -1309,33 +1471,68 @@ def build_chengdu_opportunity_png(
             small_font,
             inner_width - 72,
         )
-        card_height = 40 + 34 + 18 + len(title_lines) * 43 + 18 + 34 + len(tenderer_lines) * 30 + 30
-        cards.append((record, title_lines, tenderer_lines, max(174, card_height)))
+        key_text = _business_key_points(record)
+        key_lines = _wrap_for_image(
+            probe_draw,
+            f"商机要点：{key_text}",
+            small_font,
+            inner_width - 72,
+        )
+        if len(key_lines) > 6:
+            key_lines = key_lines[:6]
+            key_lines[-1] = key_lines[-1].rstrip("；，。") + "……"
+        contact_text = _mask_contact_for_image(record.get("contact")) or "未披露"
+        contact_lines = _wrap_for_image(
+            probe_draw,
+            f"联系方式：{contact_text}",
+            small_font,
+            inner_width - 72,
+        )
+        card_height = (
+            40
+            + 34
+            + 18
+            + len(title_lines) * 43
+            + 18
+            + 34
+            + len(tenderer_lines) * 30
+            + len(key_lines) * 30
+            + len(contact_lines) * 30
+            + 42
+        )
+        cards.append(
+            (record, title_lines, tenderer_lines, key_lines, contact_lines, max(280, card_height))
+        )
 
     header_height = 230
     empty_height = 250 if chengdu.empty else 0
     footer_height = 92
     card_gap = 22
-    total_height = header_height + empty_height + sum(card[3] + card_gap for card in cards) + footer_height
+    total_height = (
+        header_height
+        + empty_height
+        + sum(card[5] + card_gap for card in cards)
+        + footer_height
+    )
     total_height = max(540, total_height)
 
     image = Image.new("RGB", (width, total_height), "#F3F6FA")
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, width, 176), fill="#17365D")
-    draw.text((margin, 35), f"{_date_cn(report_day)} 成都地区商机", font=title_font, fill="white")
-    insurance_count = int((chengdu["business_type"] == "保险").sum())
-    engineering_count = int((chengdu["business_type"] == "工程").sum())
+    draw.text((margin, 35), f"{_date_cn(report_day)} 成都保险商机", font=title_font, fill="white")
+    no_service_count = int(
+        chengdu["service_region"].str.contains(r"无区域|未明确|未分配", regex=True, na=False).sum()
+    )
     draw.text(
         (margin, 112),
-        f"共 {len(chengdu)} 条｜保险 {insurance_count} 条｜工程 {engineering_count} 条",
+        f"共 {len(chengdu)} 条｜已分区域 {len(chengdu) - no_service_count} 条｜无我司服务点 {no_service_count} 条",
         font=subtitle_font,
         fill="#D9EAF7",
     )
     draw.rounded_rectangle((margin, 194, width - margin, 214), radius=10, fill="#DDE7F2")
     if len(chengdu):
-        insurance_amount = _money_sum(chengdu.loc[chengdu["business_type"] == "保险", "amount"])
-        engineering_amount = _money_sum(chengdu.loc[chengdu["business_type"] == "工程", "amount"])
-        summary_text = f"保险金额 {_format_amount(insurance_amount)}    工程金额 {_format_amount(engineering_amount)}"
+        insurance_amount = _money_sum(chengdu["amount"])
+        summary_text = f"保险商机金额合计 {_format_amount(insurance_amount)}"
     else:
         summary_text = "今日暂无成都地区已入选商机"
     summary_width = draw.textbbox((0, 0), summary_text, font=count_font)[2]
@@ -1355,7 +1552,7 @@ def build_chengdu_opportunity_png(
         draw.text(((width - text_width) // 2, y + 82), empty_text, font=name_font, fill="#64748B")
         y += empty_height
     else:
-        for record, title_lines, tenderer_lines, card_height in cards:
+        for record, title_lines, tenderer_lines, key_lines, contact_lines, card_height in cards:
             card_top = y
             card_bottom = y + card_height
             draw.rounded_rectangle(
@@ -1394,11 +1591,28 @@ def build_chengdu_opportunity_png(
                 "#64748B",
                 30,
             )
+            detail_y = text_y + 49 + len(tenderer_lines) * 30 + 8
+            detail_y = _render_multiline(
+                draw,
+                (margin + 36, detail_y),
+                key_lines,
+                small_font,
+                "#334155",
+                30,
+            )
+            _render_multiline(
+                draw,
+                (margin + 36, detail_y + 4),
+                contact_lines,
+                small_font,
+                "#64748B",
+                30,
+            )
             y = card_bottom + card_gap
 
     footer_y = total_height - footer_height
     draw.line((margin, footer_y, width - margin, footer_y), fill="#CBD5E1", width=2)
-    footer = "注：金额未披露不等于 0 元；未分区域或数据问题请先完成内部确认。"
+    footer = "注：群图联系方式默认脱敏；完整字段和原文链接请查看随附 Excel。"
     draw.text((margin, footer_y + 26), footer, font=small_font, fill="#64748B")
 
     output = io.BytesIO()
@@ -1408,6 +1622,167 @@ def build_chengdu_opportunity_png(
 
 
 build_chengdu_png = build_chengdu_opportunity_png
+
+
+def _filename_part(value: Any, *, max_chars: int = 36) -> str:
+    text = re.sub(r"[\\/:*?\"<>|\r\n]+", "_", _clean_text(value)).strip(" ._")
+    return (text or "未命名商机")[:max_chars]
+
+
+def _build_single_opportunity_card_png(record: pd.Series, report_day: date) -> io.BytesIO:
+    """为一条成都保险商机生成手机端可读的高清重点信息卡。"""
+
+    from PIL import Image, ImageDraw
+
+    width = 1440
+    margin = 64
+    content_width = width - margin * 2
+    title_font = _load_image_font(42, bold=True)
+    section_font = _load_image_font(28, bold=True)
+    body_font = _load_image_font(25)
+    small_font = _load_image_font(22)
+    tag_font = _load_image_font(24, bold=True)
+
+    probe = Image.new("RGB", (width, 200), "white")
+    draw_probe = ImageDraw.Draw(probe)
+    title_lines = _wrap_for_image(
+        draw_probe, record.get("project_name"), title_font, content_width - 72
+    )
+    basic_parts = [
+        f"项目编号：{_clean_text(record.get('project_number')) or '未披露'}",
+        f"采购方式：{_clean_text(record.get('procurement_method')) or _clean_text(record.get('stage')) or '未披露'}",
+        f"项目地点：{_project_location_text(record)}",
+        f"招标人/采购人：{_clean_text(record.get('tenderer')) or '未披露'}",
+    ]
+    basic_lines: list[str] = []
+    for part in basic_parts:
+        basic_lines.extend(_wrap_for_image(draw_probe, part, body_font, content_width - 96))
+
+    key_lines = _wrap_for_image(
+        draw_probe,
+        _business_key_points(record),
+        body_font,
+        content_width - 96,
+    )
+    if len(key_lines) > 12:
+        key_lines = key_lines[:12]
+        key_lines[-1] = key_lines[-1].rstrip("；，。") + "……"
+
+    contact_lines: list[str] = []
+    for part in (
+        f"截止时间：{_text_date(record.get('deadline'))}",
+        f"联系方式：{_mask_contact_for_image(record.get('contact')) or '未披露'}",
+        f"代理机构：{_clean_text(record.get('agent')) or '未披露'}",
+    ):
+        contact_lines.extend(_wrap_for_image(draw_probe, part, body_font, content_width - 96))
+
+    block_padding = 34
+    line_height = 36
+    title_height = len(title_lines) * 54
+    basic_height = 64 + len(basic_lines) * line_height + block_padding
+    key_height = 64 + len(key_lines) * line_height + block_padding
+    contact_height = 64 + len(contact_lines) * line_height + block_padding
+    total_height = max(
+        1120,
+        230 + title_height + 160 + basic_height + key_height + contact_height + 220,
+    )
+
+    image = Image.new("RGB", (width, total_height), "#F3F6FA")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width, 164), fill="#17365D")
+    category = _clean_text(record.get("category")) or "保险"
+    allocation = _allocation_label(record)
+    draw.text((margin, 32), "今日商机重点信息", font=_load_image_font(46, bold=True), fill="white")
+    draw.text(
+        (margin, 103),
+        f"{_date_cn(report_day)}  ·  {category}  ·  {allocation}",
+        font=tag_font,
+        fill="#D9EAF7",
+    )
+
+    y = 198
+    draw.rounded_rectangle(
+        (margin, y, width - margin, y + title_height + 70),
+        radius=20,
+        fill="white",
+        outline="#CBD5E1",
+        width=2,
+    )
+    _render_multiline(draw, (margin + 36, y + 34), title_lines, title_font, "#172033", 54)
+    y += title_height + 98
+
+    amount_text = _format_amount(record.get("amount"))
+    deadline_text = _text_date(record.get("deadline"))
+    method_text = _clean_text(record.get("procurement_method")) or _clean_text(record.get("stage")) or "未披露"
+    metric_text = f"金额：{amount_text}    截止：{deadline_text}    方式：{method_text}"
+    metric_lines = _wrap_for_image(draw, metric_text, section_font, content_width - 72)
+    draw.rounded_rectangle(
+        (margin, y, width - margin, y + max(92, len(metric_lines) * 42 + 36)),
+        radius=18,
+        fill="#EAF2F8",
+    )
+    _render_multiline(draw, (margin + 36, y + 24), metric_lines, section_font, "#17365D", 42)
+    y += max(92, len(metric_lines) * 42 + 36) + 24
+
+    def draw_section(section_title: str, lines: Sequence[str], height: int) -> None:
+        nonlocal y
+        draw.rounded_rectangle(
+            (margin, y, width - margin, y + height),
+            radius=18,
+            fill="white",
+            outline="#D8E0EA",
+            width=2,
+        )
+        draw.text((margin + 34, y + 24), section_title, font=section_font, fill="#17365D")
+        _render_multiline(draw, (margin + 38, y + 76), lines, body_font, "#334155", line_height)
+        y += height + 22
+
+    draw_section("基本信息", basic_lines, basic_height)
+    draw_section("项目内容与资格要点", key_lines, key_height)
+    draw_section("截止与联系", contact_lines, contact_height)
+
+    source = _clean_text(record.get("source_platform")) or "会员Excel/公开信息"
+    detail_status = _clean_text(record.get("detail_status")) or "基础字段"
+    footer = f"来源：{source}｜详情状态：{detail_status}｜原文链接见随附Excel｜群图电话已脱敏"
+    footer_lines = _wrap_for_image(draw, footer, small_font, content_width)
+    _render_multiline(draw, (margin, total_height - 92), footer_lines, small_font, "#64748B", 30)
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True, dpi=(144, 144))
+    output.seek(0)
+    return output
+
+
+def build_opportunity_cards_zip(
+    data: pd.DataFrame | Iterable[Mapping[str, Any]] | None,
+    *,
+    report_date: date | datetime | str | None = None,
+) -> io.BytesIO:
+    """批量生成成都保险商机一项目一图的 ZIP，供企业微信群直接发送。"""
+
+    frame = normalize_report_dataframe(data)
+    report_day = _report_date(report_date)
+    selected = frame[
+        frame["selected"]
+        & (frame["region_group"] == "成都地区")
+        & (frame["business_type"] == "保险")
+    ].copy()
+    selected = _sort_for_message(selected)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if selected.empty:
+            archive.writestr("今日无成都保险商机.txt", "今日暂无成都保险商机。")
+        else:
+            for sequence, (_, record) in enumerate(selected.iterrows(), 1):
+                district = _filename_part(record.get("district"), max_chars=12)
+                title = _filename_part(record.get("project_name"), max_chars=42)
+                filename = f"{sequence:02d}-{district}-{title}.png"
+                archive.writestr(
+                    filename,
+                    _build_single_opportunity_card_png(record, report_day).getvalue(),
+                )
+    output.seek(0)
+    return output
 
 
 def _text_date(value: Any) -> str:
@@ -1424,25 +1799,22 @@ def _sort_for_message(frame: pd.DataFrame) -> pd.DataFrame:
         return frame.copy()
     sorted_frame = frame.copy()
     sorted_frame["_allocation"] = sorted_frame.apply(_allocation_label, axis=1)
+    sorted_frame["_review_order"] = _review_mask(sorted_frame).astype(int)
     sorted_frame["_type_order"] = sorted_frame["business_type"].map({"保险": 0, "工程": 1}).fillna(2)
     return sorted_frame.sort_values(
-        by=["_allocation", "_type_order", "publish_date", "project_name"],
+        by=["_review_order", "_allocation", "_type_order", "publish_date", "project_name"],
         kind="stable",
     )
 
 
 def _build_concise_wecom_message(frame: pd.DataFrame, day: date) -> str:
-    """生成贴合部门现有发送习惯的短文案。
-
-    群内文字只点名需要分配的成都保险商机；数量较多的工程和川内其他
-    项目交由随附的成都图片与 Excel 承载，避免几十个标题刷屏。
-    """
+    """生成贴合部门现有发送习惯、手机端容易浏览的派单文案。"""
 
     selected = _sort_for_message(frame[frame["selected"]])
     if selected.empty:
         return "\n".join(
             [
-                f"今日商机｜{_date_short(day)}",
+                f"📌 今日商机（{_date_cn(day)}）",
                 "今日暂无符合条件的可推送商机。",
             ]
         )
@@ -1450,35 +1822,39 @@ def _build_concise_wecom_message(frame: pd.DataFrame, day: date) -> str:
     insurance = selected[selected["business_type"] == "保险"]
     engineering = selected[selected["business_type"] == "工程"]
     chengdu = selected[selected["region_group"] == "成都地区"]
-    other = selected.drop(index=chengdu.index)
+    other = selected[selected["region_group"] != "成都地区"]
     chengdu_insurance = insurance[insurance["region_group"] == "成都地区"]
-    unassigned_mask = _review_mask(chengdu_insurance)
-    assigned_insurance = chengdu_insurance.drop(index=chengdu_insurance[unassigned_mask].index)
-    unassigned_insurance = chengdu_insurance[unassigned_mask]
+    no_service_mask = chengdu_insurance["service_region"].str.contains(
+        r"无区域|未明确|未分配", regex=True, na=False
+    ) | chengdu_insurance["service_region"].str.strip().eq("")
+    assigned_insurance = chengdu_insurance[~no_service_mask]
+    no_service_insurance = chengdu_insurance[no_service_mask]
 
-    lines = [
-        f"今日商机｜{_date_short(day)}",
-        (
-            f"今日共纳入 {len(selected)} 条：保险 {len(insurance)} 条，工程 {len(engineering)} 条；"
-            f"成都地区 {len(chengdu)} 条，川内其他地区 {len(other)} 条。"
-        ),
-    ]
+    lines = [f"📌 今日商机（{_date_cn(day)}）"]
 
     if not assigned_insurance.empty:
-        lines.extend(["", "已分区域项目："])
+        lines.extend(["", f"【已分区域项目｜{len(assigned_insurance)}条】"])
         for item_no, (_, record) in enumerate(assigned_insurance.iterrows(), 1):
-            lines.append(f"{item_no}. {record['project_name']}（{_allocation_label(record)}）")
+            district = _clean_text(record["district"]) or _allocation_label(record)
+            category = _clean_text(record["category"]) or "保险"
+            lines.append(f"{item_no}. 【{district}｜{category}】")
+            lines.append(f"   {record['project_name']}")
 
-    if not unassigned_insurance.empty:
-        lines.extend(["", "未分区域项目："])
-        for item_no, (_, record) in enumerate(unassigned_insurance.iterrows(), 1):
-            lines.append(f"{item_no}. {record['project_name']}")
+    if not no_service_insurance.empty:
+        lines.extend(["", f"【无我司服务点区域｜{len(no_service_insurance)}条】"])
+        for item_no, (_, record) in enumerate(no_service_insurance.iterrows(), 1):
+            district = _clean_text(record["district"]) or "区域未明确"
+            category = _clean_text(record["category"]) or "保险"
+            lines.append(f"{item_no}. 【{district}｜{category}】")
+            lines.append(f"   {record['project_name']}")
 
+    chengdu_engineering_count = len(engineering[engineering["region_group"] == "成都地区"])
     lines.extend(
         [
             "",
-            "烦请各机构专员推送至对应机构/团队，并确认参与情况。",
-            "工程及川内其他地区项目明细见随附 Excel，成都地区汇总见随附图片。",
+            f"成都工程 {chengdu_engineering_count} 条、川内其他商机 {len(other)} 条，详见附件。",
+            "烦请各机构专员推送至对应机构/团队，并反馈是否参与。",
+            "附件：①成都重点汇总图 ②一项目一图重点卡 ③商机推送Excel",
         ]
     )
     return "\n".join(lines)
@@ -1495,18 +1871,17 @@ def build_wecom_text(
     frame = normalize_report_dataframe(data)
     day = _report_date(report_date)
     selected = _sort_for_message(frame[frame["selected"]])
-    excluded_count = len(frame) - len(selected)
     insurance = selected[selected["business_type"] == "保险"]
     engineering = selected[selected["business_type"] == "工程"]
     review = selected[_review_mask(selected)]
     assigned = selected.drop(index=review.index)
 
     lines = [
-        f"今日商机｜{_date_short(day)}",
-        f"已筛选 {len(selected)} 条：保险 {len(insurance)} 条，工程 {len(engineering)} 条；筛除 {excluded_count} 条。",
+        f"📌 今日商机详情（{_date_cn(day)}）",
+        f"本次推送：保险 {len(insurance)} 条，工程 {len(engineering)} 条。",
     ]
     if len(review):
-        lines.append(f"其中已分配 {len(assigned)} 条，未分区域项目 {len(review)} 条。")
+        lines.append(f"其中常规分配 {len(assigned)} 条，无我司服务点区域 {len(review)} 条。")
 
     if selected.empty:
         lines.append("今日暂无符合条件的可推送商机。")
@@ -1535,7 +1910,7 @@ def build_wecom_text(
                     f"   截止：{_text_date(record['deadline'])}｜招标人/采购人：{record['tenderer'] or '未披露'}"
                 )
                 if record["contact"]:
-                    lines.append(f"   联系：{record['contact']}")
+                    lines.append(f"   联系：{_mask_contact_for_image(record['contact'])}")
                 if record["url"]:
                     lines.append(f"   原文：{record['url']}")
             else:
@@ -1546,8 +1921,8 @@ def build_wecom_text(
         lines.extend(
             [
                 "",
-                f"【未分区域项目】共 {len(review)} 条",
-                "注：以下项目暂未匹配服务区域，烦请各机构专员协调确认承接机构/团队。",
+                f"【无我司服务点区域】共 {len(review)} 条",
+                "以下项目暂无我司服务点，烦请协调确认承接机构/团队。",
             ]
         )
         for item_no, (_, record) in enumerate(review.iterrows(), 1):
@@ -1561,7 +1936,7 @@ def build_wecom_text(
                     f"   截止：{_text_date(record['deadline'])}｜招标人/采购人：{record['tenderer'] or '未披露'}"
                 )
                 if record["contact"]:
-                    lines.append(f"   联系：{record['contact']}")
+                    lines.append(f"   联系：{_mask_contact_for_image(record['contact'])}")
                 if record["url"]:
                     lines.append(f"   原文：{record['url']}")
             else:
@@ -1596,5 +1971,12 @@ def build_report_bundle(
         processing_log=processing_log,
     )
     png = build_chengdu_opportunity_png(data, report_date=report_date)
+    cards_zip = build_opportunity_cards_zip(data, report_date=report_date)
     concise, full = build_wecom_messages(data, report_date=report_date)
-    return ReportBundle(excel=excel, png=png, concise_text=concise, full_text=full)
+    return ReportBundle(
+        excel=excel,
+        png=png,
+        concise_text=concise,
+        full_text=full,
+        cards_zip=cards_zip,
+    )
