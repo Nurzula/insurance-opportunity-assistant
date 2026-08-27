@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from opportunity_app import (
     _apply_ai_suggestions,
+    _apply_inline_confirmations,
     _formal_output_blockers,
     _merge_editor_changes,
     _most_common_report_date,
@@ -122,6 +124,181 @@ def test_manual_category_override_clears_internal_confirmation_gate() -> None:
     assert result.loc[0, "判定状态"] == "accepted"
     assert "人工确认" in result.loc[0, "复核意见"]
     assert _formal_output_blockers(result).empty
+
+
+def test_inline_confirmation_can_fix_candidate_insurance_without_engineering_false_block() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-inline-1",
+                "来源类型": "保险",
+                "是否纳入": True,
+                "判定状态": "review",
+                "需人工复核": True,
+                "险种分类": "企财险（候选）",
+                "商机分类": "待复核",
+                "标准金额": 165_000,
+                "金额状态": "正常",
+                "AI判定": "review",
+                "AI返回来源": "fallback",
+                "复核意见": "",
+                "项目名称": "酒店雇员忠诚险和现金险采购项目",
+            }
+        ]
+    )
+    actions = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-inline-1",
+                "是否纳入": True,
+                "人工确认": True,
+                "险种分类": "企财险",
+                "商机分类": "待复核",
+                "标准金额": 165_000,
+            }
+        ]
+    )
+
+    result = _apply_inline_confirmations(frame, actions)
+    assert result.loc[0, "险种分类"] == "企财险"
+    assert bool(result.loc[0, "需人工复核"]) is False
+    assert result.loc[0, "AI判定"] == "人工确认"
+    assert _formal_output_blockers(result, require_ai=True).empty
+
+
+def test_inline_confirmation_deselects_without_faking_ai_confirmation() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-inline-drop",
+                "来源类型": "保险",
+                "是否纳入": True,
+                "判定状态": "review",
+                "需人工复核": True,
+                "险种分类": "未确定",
+                "商机分类": "待复核",
+                "标准金额": None,
+                "金额状态": "缺失",
+                "AI判定": "review",
+                "项目名称": "待确认保险项目",
+                "复核意见": "",
+            }
+        ]
+    )
+    actions = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-inline-drop",
+                "是否纳入": False,
+                "人工确认": False,
+                "险种分类": "",
+                "商机分类": "待复核",
+                "标准金额": None,
+            }
+        ]
+    )
+
+    result = _apply_inline_confirmations(frame, actions)
+    assert bool(result.loc[0, "是否纳入"]) is False
+    assert result.loc[0, "判定状态"] == "excluded"
+    assert bool(result.loc[0, "需人工复核"]) is False
+    assert result.loc[0, "AI判定"] == "review"
+    assert "取消" in result.loc[0, "复核意见"]
+    assert _formal_output_blockers(result, require_ai=True).empty
+
+
+def test_inline_confirmation_recomputes_engineering_amount_and_clears_gate() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-inline-ok",
+                "来源类型": "工程",
+                "是否纳入": True,
+                "判定状态": "review",
+                "需人工复核": True,
+                "险种分类": "工程险",
+                "商机分类": "待复核",
+                "标准金额": None,
+                "金额状态": "缺失",
+                "AI判定": "review",
+                "AI返回来源": "fallback",
+                "项目名称": "道路改造工程",
+                "复核意见": "",
+            }
+        ]
+    )
+    actions = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-inline-ok",
+                "是否纳入": True,
+                "人工确认": True,
+                "险种分类": "工程险",
+                "商机分类": "直接施工",
+                "标准金额": 12_000_000,
+            }
+        ]
+    )
+
+    result = _apply_inline_confirmations(frame, actions, min_amount=10_000_000)
+    assert result.loc[0, "金额状态"] == "正常"
+    assert result.loc[0, "商机分类"] == "直接施工"
+    assert bool(result.loc[0, "需人工复核"]) is False
+    assert result.loc[0, "AI判定"] == "人工确认"
+    assert _formal_output_blockers(
+        result, require_ai=True, min_amount=10_000_000
+    ).empty
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected_state"),
+    [
+        (None, "缺失"),
+        ("abc", "缺失"),
+        (0, "低于门槛"),
+        (-1, "异常"),
+        (9_999_999, "低于门槛"),
+    ],
+)
+def test_inline_confirmation_never_bypasses_engineering_amount_gate(
+    amount: object, expected_state: str
+) -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-inline-bad",
+                "来源类型": "工程",
+                "是否纳入": True,
+                "判定状态": "review",
+                "需人工复核": True,
+                "险种分类": "工程险",
+                "商机分类": "待复核",
+                "标准金额": None,
+                "金额状态": "缺失",
+                "项目名称": "金额待核对工程",
+                "复核意见": "",
+            }
+        ]
+    )
+    actions = pd.DataFrame(
+        [
+            {
+                "记录ID": "工程-inline-bad",
+                "是否纳入": True,
+                "人工确认": True,
+                "险种分类": "工程险",
+                "商机分类": "直接施工",
+                "标准金额": amount,
+            }
+        ]
+    )
+
+    result = _apply_inline_confirmations(frame, actions, min_amount=10_000_000)
+    assert result.loc[0, "金额状态"] == expected_state
+    assert bool(result.loc[0, "需人工复核"]) is True
+    assert not _formal_output_blockers(
+        result, require_ai=True, min_amount=10_000_000
+    ).empty
 
 
 def test_ai_records_keep_public_evidence_and_tolerate_missing_values() -> None:

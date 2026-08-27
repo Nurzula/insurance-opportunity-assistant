@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, datetime, timedelta
 import hashlib
+import html
 import io
 import os
 import re
@@ -23,6 +24,7 @@ from opportunity_assistant.details import enrich_opportunity_details
 from opportunity_assistant.member_enrichment import enrich_member_dataframe
 from opportunity_assistant.core import (
     INSURANCE_TYPES,
+    amount_status,
     assign_regions,
     classify_engineering_dataframe,
     classify_insurance_dataframe,
@@ -38,7 +40,7 @@ from opportunity_assistant.public_sources import (
 
 
 APP_TITLE = "保险商机智能整理与推送助手"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 DEFAULT_ENGINEERING_MIN_AMOUNT = 10_000_000
 DEFAULT_NO_SERVICE_DISTRICTS = "成华区、锦江区、高新区、天府新区"
 _TERMINAL_NOTICE_PATTERN = re.compile(
@@ -50,6 +52,7 @@ CORE_EDITABLE_COLUMNS = [
     "是否纳入",
     "险种分类",
     "商机分类",
+    "标准金额",
     "区域归属",
     "复核意见",
     "推送备注",
@@ -99,7 +102,46 @@ def _inject_styles() -> None:
         <style>
         .stApp { background: #f4f7fb; }
         [data-testid="stSidebar"] { background: #0b1f3a; }
-        [data-testid="stSidebar"] * { color: #eef5ff; }
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3,
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+            color: #f4f8ff !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+            color: #c8d5e8 !important;
+        }
+        [data-testid="stSidebar"] hr { border-color: rgba(235,243,255,.22); }
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] [data-baseweb="input"],
+        [data-testid="stSidebar"] [data-testid="stTextArea"] [data-baseweb="textarea"] {
+            background: #ffffff !important;
+            border-color: #a7b7cb !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] input,
+        [data-testid="stSidebar"] [data-testid="stTextArea"] textarea {
+            color: #14243a !important;
+            -webkit-text-fill-color: #14243a !important;
+            caret-color: #0b6b69 !important;
+            opacity: 1 !important;
+            font-weight: 600;
+        }
+        [data-testid="stSidebar"] input::placeholder,
+        [data-testid="stSidebar"] textarea::placeholder {
+            color: #65758a !important;
+            opacity: 1 !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] button {
+            color: #17324f !important;
+            background: #e7eef7 !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stNumberInput"] button svg {
+            color: #17324f !important;
+            fill: currentColor !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stAlert"] p {
+            color: #f7fbff !important;
+        }
         .opp-hero {
             padding: 1.4rem 1.6rem;
             border-radius: 18px;
@@ -123,6 +165,50 @@ def _inject_styles() -> None:
             border: 1px solid #f1cf6b;
             padding: .8rem 1rem;
             border-radius: 10px;
+            color: #5d4700;
+        }
+        .confirmation-guide {
+            background: #fff8e8;
+            border: 1px solid #efc45a;
+            border-left: 5px solid #d99500;
+            border-radius: 12px;
+            color: #443000;
+            padding: .9rem 1rem;
+            margin: .4rem 0 .9rem 0;
+        }
+        .confirmation-guide strong { color: #6f4800; }
+        [data-testid="stAppViewContainer"] .confirmation-detail,
+        [data-testid="stAppViewContainer"] .confirmation-detail * {
+            color: #263f59 !important;
+            opacity: 1 !important;
+            font-size: .92rem;
+            line-height: 1.55;
+            margin: .24rem 0;
+        }
+        [data-testid="stAppViewContainer"] .confirmation-detail strong {
+            color: #142f49 !important;
+            font-weight: 700;
+        }
+        [data-testid="stAppViewContainer"] .confirmation-title,
+        [data-testid="stAppViewContainer"] .confirmation-title * {
+            color: #112f4c !important;
+            opacity: 1 !important;
+        }
+        .confirmation-title {
+            font-size: 1.04rem;
+            font-weight: 750;
+            line-height: 1.5;
+            margin: .1rem 0 .45rem 0;
+        }
+        [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"],
+        [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"] * {
+            color: #40536a !important;
+            opacity: 1 !important;
+        }
+        [data-testid="stDataFrame"] input,
+        [data-testid="stDataFrame"] textarea {
+            color: #14243a !important;
+            -webkit-text-fill-color: #14243a !important;
         }
         div[data-testid="stMetric"] {
             background: white;
@@ -151,6 +237,8 @@ def _init_state() -> None:
         "opp_source_stats": {},
         "opp_input_mode": "",
         "opp_source_hash": "",
+        "opp_confirmation_open": False,
+        "opp_effective_min_amount": DEFAULT_ENGINEERING_MIN_AMOUNT,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -360,7 +448,10 @@ def _preserve_member_engineering_rows(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _formal_output_blockers(
-    frame: pd.DataFrame, *, require_ai: bool = False
+    frame: pd.DataFrame,
+    *,
+    require_ai: bool = False,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
 ) -> pd.DataFrame:
     """返回不能进入正式推送包的已勾选记录。
 
@@ -381,16 +472,23 @@ def _formal_output_blockers(
         "来源类型", pd.Series("", index=selected.index)
     ).fillna("").astype(str)
     abnormal_amount = amount_status_values.eq("异常")
-    engineering_bad_amount = source_type.eq("工程") & ~amount_status_values.eq("正常")
+    numeric_amount = pd.to_numeric(
+        selected.get("标准金额", pd.Series(pd.NA, index=selected.index)),
+        errors="coerce",
+    )
+    engineering_bad_amount = source_type.eq("工程") & (
+        ~amount_status_values.eq("正常")
+        | (numeric_amount.notna() & numeric_amount.lt(float(min_amount)))
+    )
     insurance_categories = selected.get(
         "险种分类", pd.Series("", index=selected.index)
     ).fillna("").astype(str)
     insurance_uncertain = source_type.eq("保险") & ~insurance_categories.map(
         _valid_insurance_category
     )
-    engineering_uncertain = selected.get(
+    engineering_uncertain = source_type.eq("工程") & selected.get(
         "商机分类", pd.Series("", index=selected.index)
-    ).fillna("").astype(str).isin({"待复核", "非工程"})
+    ).fillna("").astype(str).isin({"", "待复核", "非工程"})
     protected_member_engineering = (
         _member_engineering_mask(selected)
         & amount_status_values.eq("正常")
@@ -542,7 +640,13 @@ def _to_reporting_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _merge_editor_changes(full_frame: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
+def _merge_editor_changes(
+    full_frame: pd.DataFrame,
+    edited: pd.DataFrame,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+    auto_confirm: bool = True,
+) -> pd.DataFrame:
     result = full_frame.copy()
     if "记录ID" not in edited.columns or "记录ID" not in result.columns:
         return result
@@ -553,6 +657,10 @@ def _merge_editor_changes(full_frame: pd.DataFrame, edited: pd.DataFrame) -> pd.
     original_engineering = full_frame.get(
         "商机分类", pd.Series("", index=full_frame.index)
     ).fillna("").astype(str)
+    original_amount = pd.to_numeric(
+        full_frame.get("标准金额", pd.Series(pd.NA, index=full_frame.index)),
+        errors="coerce",
+    )
     changes = edited.set_index("记录ID")
     ids = result["记录ID"]
     for column in CORE_EDITABLE_COLUMNS:
@@ -566,6 +674,17 @@ def _merge_editor_changes(full_frame: pd.DataFrame, edited: pd.DataFrame) -> pd.
         else:
             result.loc[valid, column] = values.to_numpy()
 
+    if "标准金额" in result.columns:
+        source_values = result.get(
+            "来源类型", pd.Series("", index=result.index)
+        ).fillna("").astype(str)
+        result["金额状态"] = [
+            amount_status(value, min_amount=min_amount)
+            if source_type == "工程"
+            else amount_status(value)
+            for value, source_type in zip(result["标准金额"], source_values)
+        ]
+
     # 当老师明确勾选并把疑难项改成有效业务分类时，视为已完成内部确认。
     # 若仍是“候选/未确定/非工程”等状态，则保留质量闸门，避免半成品输出。
     selected = _selected_mask(result)
@@ -574,14 +693,22 @@ def _merge_editor_changes(full_frame: pd.DataFrame, edited: pd.DataFrame) -> pd.
     engineering_category = result.get("商机分类", pd.Series("", index=result.index)).fillna("").astype(str)
     confirmed = selected & (
         (source.eq("保险") & insurance_category.map(_valid_insurance_category))
-        | (source.eq("工程") & engineering_category.isin({"直接施工", "前期线索"}))
+        | (
+            source.eq("工程")
+            & engineering_category.isin({"工程项目", "直接施工", "前期线索"})
+        )
+    )
+    current_amount = pd.to_numeric(
+        result.get("标准金额", pd.Series(pd.NA, index=result.index)),
+        errors="coerce",
     )
     manual_change = (
         (selected & ~original_selected.reindex(result.index, fill_value=False))
         | insurance_category.ne(original_insurance.reindex(result.index, fill_value=""))
         | engineering_category.ne(original_engineering.reindex(result.index, fill_value=""))
+        | current_amount.fillna(-1).ne(original_amount.reindex(result.index).fillna(-1))
     )
-    if "需人工复核" in result.columns:
+    if auto_confirm and "需人工复核" in result.columns:
         newly_confirmed = confirmed & manual_change
         result.loc[newly_confirmed, "需人工复核"] = False
         if "判定状态" in result.columns:
@@ -594,7 +721,160 @@ def _merge_editor_changes(full_frame: pd.DataFrame, edited: pd.DataFrame) -> pd.
     return result
 
 
-def _editor(frame: pd.DataFrame, source_type: str, key: str) -> pd.DataFrame:
+def _confirmation_issue_text(
+    row: pd.Series, *, min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT
+) -> str:
+    """把质量闸门转成业务人员能直接理解的待办说明。"""
+
+    issues: list[str] = []
+    source_type = str(row.get("来源类型", "") or "").strip()
+    title_and_reason = " ".join(
+        [str(row.get("项目名称", "") or ""), str(row.get("判定理由", "") or "")]
+    )
+    if _TERMINAL_NOTICE_PATTERN.search(title_and_reason):
+        return "源平台已标记为失效或即将删除：请取消本次推送"
+
+    if source_type == "保险":
+        if not _valid_insurance_category(row.get("险种分类", "")):
+            issues.append("请选择八大险种中的正确分类")
+        money_state = amount_status(row.get("标准金额"))
+        if money_state == "异常":
+            issues.append("金额异常，请核对并填写正确金额")
+    elif source_type == "工程":
+        category = str(row.get("商机分类", "") or "").strip()
+        if category not in {"工程项目", "直接施工", "前期线索"}:
+            issues.append("请选择正确的工程线索类型")
+        money_state = amount_status(row.get("标准金额"), min_amount=min_amount)
+        if money_state == "缺失":
+            issues.append(f"请填写工程金额（必须达到{min_amount:,.0f}元）")
+        elif money_state == "低于门槛":
+            issues.append(f"金额低于{min_amount:,.0f}元门槛，请核对或取消推送")
+        elif money_state == "异常":
+            issues.append("金额异常，请核对并填写正确金额")
+
+    ai_decision = str(row.get("AI判定", "") or "").strip()
+    ai_source = str(row.get("AI返回来源", "") or "").strip().lower()
+    if ai_decision != "人工确认" and not (
+        ai_source == "ai" and ai_decision in {"include", "review"}
+    ):
+        issues.append("AI未能稳定判断，需要业务人员明确确认")
+    if bool(row.get("需人工复核", False)) and not issues:
+        issues.append("规则或AI标记为需要业务确认")
+    return "；".join(dict.fromkeys(issues)) or "请核对分类和金额后确认是否推送"
+
+
+def _apply_inline_confirmations(
+    full_frame: pd.DataFrame,
+    actions: pd.DataFrame,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+) -> pd.DataFrame:
+    """应用生成区的逐条人工处理，不允许绕过金额和失效公告闸门。"""
+
+    result = full_frame.copy()
+    if actions.empty or "记录ID" not in actions.columns or "记录ID" not in result.columns:
+        return result
+
+    record_ids = result["记录ID"].fillna("").astype(str)
+    for _, action in actions.iterrows():
+        record_id = str(action.get("记录ID", "") or "")
+        matches = result.index[record_ids.eq(record_id)]
+        if len(matches) == 0:
+            continue
+        index = matches[0]
+        source_type = str(result.at[index, "来源类型"] or "").strip()
+        keep_selected = bool(action.get("是否纳入", False))
+        explicitly_confirmed = bool(action.get("人工确认", False))
+
+        result.at[index, "是否纳入"] = keep_selected
+        if "险种分类" in action.index and source_type == "保险":
+            result.at[index, "险种分类"] = str(action.get("险种分类", "") or "").strip()
+        if "商机分类" in action.index and source_type == "工程":
+            result.at[index, "商机分类"] = str(action.get("商机分类", "") or "").strip()
+
+        old_amount = pd.to_numeric(
+            pd.Series([result.at[index, "标准金额"]]), errors="coerce"
+        ).iloc[0]
+        raw_amount = action.get("标准金额", None)
+        new_amount = pd.to_numeric(pd.Series([raw_amount]), errors="coerce").iloc[0]
+        result.at[index, "标准金额"] = None if pd.isna(new_amount) else float(new_amount)
+        amount_changed = not (
+            (pd.isna(old_amount) and pd.isna(new_amount))
+            or (
+                not pd.isna(old_amount)
+                and not pd.isna(new_amount)
+                and float(old_amount) == float(new_amount)
+            )
+        )
+        if amount_changed:
+            if "金额提取依据" not in result.columns:
+                result["金额提取依据"] = ""
+            result.at[index, "金额提取依据"] = (
+                "业务人员手工确认：金额未公开"
+                if pd.isna(new_amount)
+                else f"业务人员手工确认：{float(new_amount):,.0f}元"
+            )
+
+        current_amount = result.at[index, "标准金额"]
+        current_amount_state = (
+            amount_status(current_amount, min_amount=min_amount)
+            if source_type == "工程"
+            else amount_status(current_amount)
+        )
+        result.at[index, "金额状态"] = current_amount_state
+
+        if not keep_selected:
+            result.at[index, "判定状态"] = "excluded"
+            result.at[index, "需人工复核"] = False
+            result.at[index, "复核意见"] = "业务人员取消本次推送"
+            continue
+
+        terminal = bool(_terminal_notice_mask(result.loc[[index]]).iloc[0])
+        insurance_valid = source_type == "保险" and _valid_insurance_category(
+            result.at[index, "险种分类"]
+        )
+        engineering_valid = source_type == "工程" and (
+            str(result.at[index, "商机分类"] or "").strip()
+            in {"工程项目", "直接施工", "前期线索"}
+            and current_amount_state == "正常"
+        )
+        amount_valid = current_amount_state != "异常"
+        can_confirm = (
+            explicitly_confirmed
+            and not terminal
+            and amount_valid
+            and (insurance_valid or engineering_valid)
+        )
+        if can_confirm:
+            result.at[index, "判定状态"] = "accepted"
+            result.at[index, "需人工复核"] = False
+            result.at[index, "AI判定"] = "人工确认"
+            category = (
+                str(result.at[index, "险种分类"] or "").strip()
+                if source_type == "保险"
+                else str(result.at[index, "商机分类"] or "").strip()
+            )
+            amount_note = (
+                "金额未公开"
+                if pd.isna(new_amount)
+                else f"金额{float(new_amount):,.0f}元"
+            )
+            result.at[index, "复核意见"] = (
+                f"业务人员已确认纳入；分类：{category}；{amount_note}"
+            )
+        else:
+            result.at[index, "判定状态"] = "review"
+            result.at[index, "需人工复核"] = True
+    return result
+
+
+def _editor(
+    frame: pd.DataFrame,
+    source_type: str,
+    key: str,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+) -> pd.DataFrame:
     subset = frame[frame["来源类型"].eq(source_type)].copy()
     if subset.empty:
         st.info(f"没有{source_type}数据。")
@@ -636,7 +916,16 @@ def _editor(frame: pd.DataFrame, source_type: str, key: str) -> pd.DataFrame:
     disabled = [
         column
         for column in columns
-        if column not in {"是否纳入", "险种分类", "商机分类", "区域归属", "复核意见", "推送备注"}
+        if column
+        not in {
+            "是否纳入",
+            "险种分类",
+            "商机分类",
+            "标准金额",
+            "区域归属",
+            "复核意见",
+            "推送备注",
+        }
     ]
     column_config: dict[str, Any] = {
         "记录ID": st.column_config.TextColumn("记录ID", width="small"),
@@ -671,7 +960,7 @@ def _editor(frame: pd.DataFrame, source_type: str, key: str) -> pd.DataFrame:
         editor_frame["商机分类"] = editor_frame["商机分类"].replace({"待复核": "需确认"})
         column_config["商机分类"] = st.column_config.SelectboxColumn(
             "工程线索",
-            options=["直接施工", "前期线索", "非工程", "需确认"],
+            options=["工程项目", "直接施工", "前期线索", "非工程", "需确认"],
         )
 
     edited = st.data_editor(
@@ -685,7 +974,7 @@ def _editor(frame: pd.DataFrame, source_type: str, key: str) -> pd.DataFrame:
     )
     if "商机分类" in edited.columns:
         edited["商机分类"] = edited["商机分类"].replace({"需确认": "待复核"})
-    return _merge_editor_changes(frame, edited)
+    return _merge_editor_changes(frame, edited, min_amount=min_amount)
 
 
 def _evidence_excerpt(value: Any, source_type: str, max_length: int = 1_800) -> str:
@@ -1347,6 +1636,8 @@ def _finalize_input_frames(
 
     st.session_state.opp_results = combined
     st.session_state.opp_bundle = None
+    st.session_state.opp_confirmation_open = False
+    st.session_state.opp_effective_min_amount = float(min_amount)
     st.session_state.opp_report_date = report_date_hint or _most_common_report_date(combined)
     st.session_state.opp_source_hash = source_hash
     st.session_state.opp_source_stats = source_stats or {}
@@ -1577,36 +1868,247 @@ def _render_ai_panel(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _render_outputs(frame: pd.DataFrame) -> None:
+def _render_inline_confirmation_form(
+    blockers: pd.DataFrame,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+) -> tuple[pd.DataFrame, bool]:
+    """在错误提示正下方逐条展示可操作的业务确认卡。"""
+
+    st.markdown(
+        """
+        <div class="confirmation-guide">
+          <strong>请直接在下面处理，不需要返回上方寻找项目：</strong><br>
+          ① 不准备推送：取消“保留在本次推送中”；<br>
+          ② 需要推送：核对分类和金额，再勾选“我已确认可推送”；<br>
+          ③ 最后点击“保存处理结果并生成正式推送包”。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    record_ids = blockers.get("记录ID", pd.Series(blockers.index, index=blockers.index))
+    panel_token = hashlib.sha256(
+        "|".join(record_ids.fillna("").astype(str).tolist()).encode("utf-8")
+    ).hexdigest()[:12]
+    source_token = str(st.session_state.opp_source_hash or "current")[:12]
+    actions: list[dict[str, Any]] = []
+
+    with st.form(f"opp_inline_confirmation_form_{source_token}_{panel_token}"):
+        st.markdown(f"#### 待处理项目（{len(blockers)}条）")
+        for position, (_, row) in enumerate(blockers.iterrows(), start=1):
+            record_id = str(row.get("记录ID", "") or f"row-{position}")
+            key_token = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:12]
+            source_type = str(row.get("来源类型", "") or "").strip()
+            title = str(row.get("项目名称", "") or "未命名项目").strip()
+            terminal = bool(_terminal_notice_mask(pd.DataFrame([row])).iloc[0])
+            current_amount = pd.to_numeric(
+                pd.Series([row.get("标准金额", None)]), errors="coerce"
+            ).iloc[0]
+            amount_input_value = (
+                None
+                if pd.isna(current_amount) or float(current_amount) < 0
+                else float(current_amount)
+            )
+
+            with st.container(border=True):
+                st.markdown(
+                    f"<div class='confirmation-title'>{position}. {html.escape(title)}</div>",
+                    unsafe_allow_html=True,
+                )
+                issue_text = _confirmation_issue_text(row, min_amount=min_amount)
+                st.markdown(
+                    "<div class='confirmation-detail'><strong>待确认事项：</strong>"
+                    f"{html.escape(issue_text)}</div>",
+                    unsafe_allow_html=True,
+                )
+                reason = _first_nonempty_text(
+                    row.get("AI理由", ""),
+                    row.get("判定理由", ""),
+                    row.get("证据摘录", ""),
+                )
+                if reason:
+                    st.markdown(
+                        "<div class='confirmation-detail'><strong>判断依据：</strong>"
+                        f"{html.escape(reason[:320])}</div>",
+                        unsafe_allow_html=True,
+                    )
+                if terminal:
+                    st.warning("该公告已失效或即将删除，不能强行确认纳入，请取消推送。")
+
+                keep_col, class_col, amount_col, confirm_col = st.columns(
+                    [1.05, 1.65, 1.25, 1.25]
+                )
+                keep_selected = keep_col.checkbox(
+                    "保留在本次推送中",
+                    value=True,
+                    key=f"opp_keep_{source_token}_{key_token}",
+                    help="取消勾选后，该项目不会进入群文案、图片和Excel正式明细。",
+                )
+                if source_type == "保险":
+                    current_parts = [
+                        part.strip()
+                        for part in str(row.get("险种分类", "") or "")
+                        .replace("，", "、")
+                        .split("、")
+                        if part.strip() in INSURANCE_TYPES
+                    ]
+                    selected_categories = class_col.multiselect(
+                        "确认险种分类（可多选）",
+                        options=list(INSURANCE_TYPES),
+                        default=current_parts,
+                        key=f"opp_insurance_category_{source_token}_{key_token}",
+                        disabled=terminal,
+                    )
+                    insurance_category = "、".join(selected_categories)
+                    engineering_category = str(row.get("商机分类", "") or "")
+                else:
+                    engineering_options = [
+                        "请选择分类",
+                        "工程项目",
+                        "直接施工",
+                        "前期线索",
+                        "非工程",
+                    ]
+                    current_engineering = str(row.get("商机分类", "") or "").strip()
+                    default_index = (
+                        engineering_options.index(current_engineering)
+                        if current_engineering in engineering_options
+                        else 0
+                    )
+                    chosen_engineering = class_col.selectbox(
+                        "确认工程线索类型",
+                        options=engineering_options,
+                        index=default_index,
+                        key=f"opp_engineering_category_{source_token}_{key_token}",
+                        disabled=terminal,
+                    )
+                    engineering_category = (
+                        "" if chosen_engineering == "请选择分类" else chosen_engineering
+                    )
+                    insurance_category = str(row.get("险种分类", "") or "")
+
+                confirmed_amount = amount_col.number_input(
+                    "确认招标金额（元）",
+                    min_value=0.0,
+                    value=amount_input_value,
+                    step=10_000.0,
+                    format="%.0f",
+                    key=f"opp_amount_{source_token}_{key_token}",
+                    disabled=terminal,
+                    help=(
+                        f"工程项目必须达到{min_amount:,.0f}元；保险金额未公开时可以留空。"
+                    ),
+                )
+                manually_confirmed = confirm_col.checkbox(
+                    "我已确认可推送",
+                    value=False,
+                    key=f"opp_confirm_{source_token}_{key_token}",
+                    disabled=terminal,
+                    help="只有勾选本项，系统才会解除该项目的内部确认锁定。",
+                )
+                actions.append(
+                    {
+                        "记录ID": record_id,
+                        "是否纳入": keep_selected,
+                        "人工确认": manually_confirmed,
+                        "险种分类": insurance_category,
+                        "商机分类": engineering_category,
+                        "标准金额": confirmed_amount,
+                    }
+                )
+
+        submitted = st.form_submit_button(
+            "✅ 保存处理结果并生成正式推送包",
+            type="primary",
+            width="stretch",
+        )
+    return pd.DataFrame(actions), submitted
+
+
+def _build_and_store_bundle(frame: pd.DataFrame, report_date: date) -> None:
+    selected_count = int(_selected_mask(frame).sum())
+    with st.spinner("正在内存中生成商机包..."):
+        report_frame = _to_reporting_frame(frame)
+        bundle = build_report_bundle(
+            report_frame,
+            report_date=report_date,
+            processing_log=st.session_state.opp_logs,
+        )
+    st.session_state.opp_bundle = bundle
+    st.session_state.opp_report_date = report_date
+    _log(f"商机包生成完成，共纳入 {selected_count} 条公告。")
+
+
+def _render_outputs(
+    frame: pd.DataFrame,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+) -> None:
     st.subheader("③ 生成今日商机包")
     report_date = st.date_input(
         "报告日期",
         value=st.session_state.opp_report_date or date.today(),
         key="opp_date_input",
     )
-    if st.button("✨ 一键生成群文案、重点信息图和Excel", type="primary", width="stretch"):
+    generate_clicked = st.button(
+        "✨ 一键生成群文案、重点信息图和Excel",
+        type="primary",
+        width="stretch",
+    )
+    if generate_clicked:
         selected_count = int(_selected_mask(frame).sum())
-        blockers = _formal_output_blockers(frame, require_ai=True)
+        blockers = _formal_output_blockers(
+            frame, require_ai=True, min_amount=min_amount
+        )
         if selected_count == 0:
             st.warning("当前没有勾选任何推送项目。")
         elif not blockers.empty:
-            names = "；".join(blockers["项目名称"].fillna("").astype(str).head(5).tolist())
-            more = "……" if len(blockers) > 5 else ""
-            st.error(
-                f"有 {len(blockers)} 条已勾选项目尚未完成内部确认，系统已阻止生成正式推送包。"
-                f"请取消勾选或确认分类/金额后再生成：{names}{more}"
-            )
+            st.session_state.opp_confirmation_open = True
+            st.session_state.opp_bundle = None
         else:
-            with st.spinner("正在内存中生成商机包..."):
-                report_frame = _to_reporting_frame(frame)
-                bundle = build_report_bundle(
-                    report_frame,
-                    report_date=report_date,
-                    processing_log=st.session_state.opp_logs,
+            st.session_state.opp_confirmation_open = False
+            _build_and_store_bundle(frame, report_date)
+
+    if st.session_state.opp_confirmation_open:
+        blockers = _formal_output_blockers(
+            frame, require_ai=True, min_amount=min_amount
+        )
+        if blockers.empty:
+            st.session_state.opp_confirmation_open = False
+        else:
+            st.error(
+                f"有 {len(blockers)} 条已勾选项目需要业务确认，系统暂未生成正式推送包。"
+                "请直接在下方逐条取消推送，或核对分类和金额后确认。"
+            )
+            actions, submitted = _render_inline_confirmation_form(
+                blockers, min_amount=min_amount
+            )
+            if submitted:
+                frame = _apply_inline_confirmations(
+                    frame, actions, min_amount=min_amount
                 )
-            st.session_state.opp_bundle = bundle
-            st.session_state.opp_report_date = report_date
-            _log(f"商机包生成完成，共纳入 {selected_count} 条公告。")
+                st.session_state.opp_results = frame
+                st.session_state.opp_bundle = None
+                selected_count = int(_selected_mask(frame).sum())
+                remaining = _formal_output_blockers(
+                    frame, require_ai=True, min_amount=min_amount
+                )
+                if selected_count == 0:
+                    st.session_state.opp_confirmation_open = False
+                    st.warning("处理已保存，但当前没有保留任何推送项目，因此未生成推送包。")
+                elif not remaining.empty:
+                    st.session_state.opp_confirmation_open = True
+                    remaining_names = "；".join(
+                        remaining["项目名称"].fillna("").astype(str).head(3).tolist()
+                    )
+                    st.error(
+                        f"还有 {len(remaining)} 条未完成确认：{remaining_names}。"
+                        "请核对分类、工程金额门槛以及“我已确认可推送”勾选项。"
+                    )
+                else:
+                    st.session_state.opp_confirmation_open = False
+                    _build_and_store_bundle(frame, report_date)
+                    st.success("确认已保存，正式推送包已生成。")
 
     bundle = st.session_state.opp_bundle
     if bundle is None:
@@ -1821,9 +2323,19 @@ def main() -> None:
         ["保险商机", "工程商机", "筛除与质量记录", "AI审查记录"]
     )
     with insurance_tab:
-        frame = _editor(frame, "保险", "insurance_editor")
+        frame = _editor(
+            frame,
+            "保险",
+            "insurance_editor",
+            min_amount=float(st.session_state.opp_effective_min_amount),
+        )
     with engineering_tab:
-        frame = _editor(frame, "工程", "engineering_editor")
+        frame = _editor(
+            frame,
+            "工程",
+            "engineering_editor",
+            min_amount=float(st.session_state.opp_effective_min_amount),
+        )
     with excluded_tab:
         excluded = frame[frame.get("判定状态", "").astype(str).eq("excluded")]
         if excluded.empty:
@@ -1849,7 +2361,10 @@ def main() -> None:
 
     st.session_state.opp_results = frame
     st.markdown("---")
-    _render_outputs(frame)
+    _render_outputs(
+        frame,
+        min_amount=float(st.session_state.opp_effective_min_amount),
+    )
     st.caption("提示：报告是业务线索整理结果，发送前仍应由经办老师完成最终确认。")
 
 
