@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from opportunity_assistant.core import classify_insurance_dataframe
 from opportunity_assistant.member_enrichment import (
     enrich_member_dataframe,
     normalize_match_title,
@@ -78,6 +79,22 @@ def test_high_confidence_match_copies_official_evidence_and_preserves_member_url
     assert stats["matched_rows"] == 1
     assert stats["official_rows_used"] == 1
     assert stats["match_rate"] == pytest.approx(1.0)
+
+
+def test_member_url_survives_the_following_insurance_classification_step() -> None:
+    enriched, _ = enrich_member_dataframe(
+        pd.DataFrame([_member()]),
+        pd.DataFrame([_official()]),
+    )
+
+    classified = classify_insurance_dataframe(enriched)
+
+    assert classified.loc[0, "会员查看地址"] == (
+        "https://www.yfb.example/info/paid-1"
+    )
+    assert classified.loc[0, "官网查看地址"] == (
+        "https://ggzyjy.sc.gov.cn/jyxx/official-1.html"
+    )
 
 
 def test_inputs_are_not_mutated() -> None:

@@ -7,11 +7,14 @@ from opportunity_app import (
     _apply_ai_suggestions,
     _apply_inline_confirmations,
     _formal_output_blockers,
+    _insurance_member_link_frame,
     _merge_editor_changes,
     _most_common_report_date,
     _preserve_member_engineering_rows,
+    _preserve_member_source_urls,
     _records_for_ai,
     _resolve_exact_duplicate_announcements,
+    _safe_http_url,
     _to_reporting_frame,
 )
 
@@ -299,6 +302,170 @@ def test_inline_confirmation_never_bypasses_engineering_amount_gate(
     assert not _formal_output_blockers(
         result, require_ai=True, min_amount=10_000_000
     ).empty
+
+
+def test_insurance_member_links_only_include_formally_eligible_insurance() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-link-ok",
+                "来源类型": "保险",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "险种分类": "责任险",
+                "商机分类": "待复核",
+                "标准金额": 85_000,
+                "金额状态": "正常",
+                "AI判定": "include",
+                "AI返回来源": "ai",
+                "输入模式": "会员Excel导入",
+                "项目名称": "公众责任险采购项目",
+                "区域归属": "金牛区",
+                "招标阶段": "采购公告",
+                "会员查看地址": "https://qiye.example/member/insurance-1",
+                "官网查看地址": "https://official.example/insurance-1",
+            },
+            {
+                "记录ID": "保险-link-review",
+                "来源类型": "保险",
+                "是否纳入": True,
+                "判定状态": "review",
+                "需人工复核": True,
+                "险种分类": "未确定",
+                "标准金额": None,
+                "金额状态": "缺失",
+                "AI判定": "review",
+                "AI返回来源": "ai",
+                "输入模式": "会员Excel导入",
+                "项目名称": "待确认保险项目",
+                "会员查看地址": "https://qiye.example/member/review",
+            },
+            {
+                "记录ID": "工程-link-ignore",
+                "来源类型": "工程",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "险种分类": "工程险",
+                "商机分类": "直接施工",
+                "标准金额": 20_000_000,
+                "金额状态": "正常",
+                "AI判定": "include",
+                "AI返回来源": "ai",
+                "输入模式": "会员Excel导入",
+                "项目名称": "道路施工项目",
+                "会员查看地址": "https://qiye.example/member/engineering",
+            },
+            {
+                "记录ID": "保险-link-excluded",
+                "来源类型": "保险",
+                "是否纳入": False,
+                "判定状态": "excluded",
+                "需人工复核": False,
+                "险种分类": "责任险",
+                "标准金额": 100_000,
+                "金额状态": "正常",
+                "AI判定": "exclude",
+                "AI返回来源": "ai",
+                "输入模式": "会员Excel导入",
+                "项目名称": "已筛除保险项目",
+                "会员查看地址": "https://qiye.example/member/excluded",
+            },
+        ]
+    )
+
+    result = _insurance_member_link_frame(frame)
+
+    assert result["项目名称"].tolist() == ["公众责任险采购项目"]
+    assert result.loc[0, "会员详情地址"] == (
+        "https://qiye.example/member/insurance-1"
+    )
+    assert result.loc[0, "链接状态"] == "可打开"
+
+
+def test_insurance_member_links_fall_back_to_exported_url_for_legacy_rows() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-link-legacy",
+                "来源类型": "保险",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "险种分类": "意外险",
+                "标准金额": 120_000,
+                "金额状态": "正常",
+                "AI判定": "人工确认",
+                "AI返回来源": "fallback",
+                "输入模式": "会员Excel导入",
+                "项目名称": "团体意外险采购项目",
+                "官网查看地址": "https://qiye.example/member/legacy",
+            }
+        ]
+    )
+
+    result = _insurance_member_link_frame(frame)
+
+    assert result.loc[0, "会员详情地址"] == (
+        "https://qiye.example/member/legacy"
+    )
+
+
+def test_insurance_member_links_reject_unsafe_source_url() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "记录ID": "保险-link-unsafe",
+                "来源类型": "保险",
+                "是否纳入": True,
+                "判定状态": "accepted",
+                "需人工复核": False,
+                "险种分类": "企财险",
+                "标准金额": 200_000,
+                "金额状态": "正常",
+                "AI判定": "include",
+                "AI返回来源": "ai",
+                "输入模式": "会员Excel导入",
+                "项目名称": "企业财产保险采购项目",
+                "会员查看地址": "javascript:alert(1)",
+                "官网查看地址": "https://official.example/not-the-member-url",
+            }
+        ]
+    )
+
+    result = _insurance_member_link_frame(frame)
+
+    assert result.loc[0, "会员详情地址"] == ""
+    assert result.loc[0, "链接状态"] == "地址格式不可用"
+    assert _safe_http_url("https://user:secret@example.com/private") == ""
+    assert _safe_http_url("https://example.com/detail?id=1") == (
+        "https://example.com/detail?id=1"
+    )
+
+
+def test_preserve_member_source_urls_runs_before_optional_official_lookup() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "项目名称": "源表项目一",
+                "官网查看地址": "https://qiye.example/member/one",
+            },
+            {
+                "项目名称": "源表项目二",
+                "官网查看地址": "https://qiye.example/member/two",
+                "会员查看地址": "https://qiye.example/member/already-preserved",
+            },
+        ]
+    )
+
+    result = _preserve_member_source_urls(frame)
+
+    assert result["会员查看地址"].tolist() == [
+        "https://qiye.example/member/one",
+        "https://qiye.example/member/already-preserved",
+    ]
+    assert pd.isna(frame.loc[0, "会员查看地址"])
 
 
 def test_ai_records_keep_public_evidence_and_tolerate_missing_values() -> None:

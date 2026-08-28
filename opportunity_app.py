@@ -14,6 +14,7 @@ import io
 import os
 import re
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 import zipfile
 
 import pandas as pd
@@ -40,7 +41,7 @@ from opportunity_assistant.public_sources import (
 
 
 APP_TITLE = "保险商机智能整理与推送助手"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 DEFAULT_ENGINEERING_MIN_AMOUNT = 10_000_000
 DEFAULT_NO_SERVICE_DISTRICTS = "成华区、锦江区、高新区、天府新区"
 _TERMINAL_NOTICE_PATTERN = re.compile(
@@ -239,6 +240,8 @@ def _init_state() -> None:
         "opp_source_hash": "",
         "opp_confirmation_open": False,
         "opp_effective_min_amount": DEFAULT_ENGINEERING_MIN_AMOUNT,
+        "opp_flash_message": "",
+        "opp_flash_level": "success",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -380,6 +383,53 @@ def _selected_mask(frame: pd.DataFrame) -> pd.Series:
 def _valid_insurance_category(value: Any) -> bool:
     parts = [part.strip() for part in str(value or "").replace("，", "、").split("、") if part.strip()]
     return bool(parts) and all(part in INSURANCE_TYPES for part in parts)
+
+
+def _safe_http_url(value: Any) -> str:
+    """返回可安全展示的 HTTP(S) 地址，拒绝脚本协议和异常链接。"""
+
+    if value is None:
+        return ""
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    text = str(value).strip()
+    if not text or any(character.isspace() for character in text):
+        return ""
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return ""
+    return text
+
+
+def _preserve_member_source_urls(frame: pd.DataFrame) -> pd.DataFrame:
+    """在任何官网补全发生前保存会员导出表中的原始详情地址。"""
+
+    result = frame.copy(deep=True)
+    original_urls = result.get(
+        "官网查看地址",
+        pd.Series("", index=result.index, dtype=object),
+    )
+    existing_urls = result.get(
+        "会员查看地址",
+        pd.Series("", index=result.index, dtype=object),
+    )
+    existing_text = existing_urls.fillna("").astype(str).str.strip()
+    result["会员查看地址"] = existing_urls.where(
+        existing_text.ne(""),
+        original_urls,
+    )
+    return result
 
 
 def _member_engineering_mask(frame: pd.DataFrame) -> pd.Series:
@@ -542,6 +592,136 @@ def _formal_output_blockers(
         | ai_unverified
         | public_detail_missing
     ]
+
+
+def _insurance_member_link_frame(
+    frame: pd.DataFrame,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+) -> pd.DataFrame:
+    """整理已满足正式推送条件的保险项目及其会员详情入口。
+
+    会员表的原始 ``官网查看地址`` 在官网补全阶段会保存到
+    ``会员查看地址``，因此该列优先且不回退到可能被替换后的官方链接。
+    """
+
+    output_columns = [
+        "序号",
+        "区域归属",
+        "险种分类",
+        "项目名称",
+        "标准金额",
+        "招标阶段",
+        "会员详情地址",
+        "链接状态",
+    ]
+    if frame.empty or "来源类型" not in frame.columns:
+        return pd.DataFrame(columns=output_columns)
+
+    selected_insurance = frame.loc[
+        _selected_mask(frame)
+        & frame["来源类型"].fillna("").astype(str).eq("保险")
+    ].copy()
+    if selected_insurance.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    blockers = _formal_output_blockers(
+        frame,
+        require_ai=True,
+        min_amount=min_amount,
+    )
+    selected_insurance = selected_insurance.loc[
+        ~selected_insurance.index.isin(blockers.index)
+    ].copy()
+    if selected_insurance.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    # 官网匹配成功后“官网查看地址”可能变成政府公开页；原乙方宝链接已被
+    # 明确保存在“会员查看地址”。只有旧数据没有该列时才回退到原字段。
+    if "会员查看地址" in selected_insurance.columns:
+        raw_urls = selected_insurance["会员查看地址"]
+    else:
+        raw_urls = selected_insurance.get(
+            "官网查看地址",
+            pd.Series("", index=selected_insurance.index, dtype=object),
+        )
+    raw_url_text = raw_urls.fillna("").astype(str).str.strip()
+    safe_urls = raw_urls.map(_safe_http_url)
+
+    result = pd.DataFrame(index=selected_insurance.index)
+    for column in (
+        "区域归属",
+        "险种分类",
+        "项目名称",
+        "标准金额",
+        "招标阶段",
+    ):
+        result[column] = selected_insurance.get(
+            column,
+            pd.Series("", index=selected_insurance.index, dtype=object),
+        )
+    result["会员详情地址"] = safe_urls
+    result["链接状态"] = [
+        "可打开"
+        if safe_url
+        else ("地址格式不可用" if raw_url else "源表未提供")
+        for safe_url, raw_url in zip(safe_urls, raw_url_text)
+    ]
+    result = result.sort_values(
+        ["区域归属", "项目名称"],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+    result.insert(0, "序号", range(1, len(result) + 1))
+    return result.reindex(columns=output_columns)
+
+
+def _render_insurance_member_links(
+    frame: pd.DataFrame,
+    *,
+    min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
+) -> None:
+    """在独立前端页展示合格保险项目的乙方宝会员详情入口。"""
+
+    st.markdown("#### 🔗 保险商机会员详情入口")
+    st.caption(
+        "仅显示已勾选、已通过规则与AI审查且不再需要内部确认的保险项目。"
+        "点击“打开会员详情”后，可使用公司的乙方宝会员账号查看并截图；链接不会发送给大模型。"
+    )
+    links = _insurance_member_link_frame(frame, min_amount=min_amount)
+    if links.empty:
+        st.info("当前没有已完成审查的保险项目；待确认项目处理完成后会自动出现在这里。")
+        return
+
+    available_count = int(links["会员详情地址"].fillna("").astype(str).str.strip().ne("").sum())
+    missing_count = len(links) - available_count
+    st.success(
+        f"当前共有 {len(links)} 条合格保险商机，其中 {available_count} 条可直接打开会员详情。"
+    )
+    if missing_count:
+        st.warning(
+            f"另有 {missing_count} 条的源表未提供有效会员地址，已保留在列表中供核对。"
+        )
+    st.dataframe(
+        links,
+        hide_index=True,
+        width="stretch",
+        height=min(680, max(220, 44 * (len(links) + 1))),
+        column_config={
+            "序号": st.column_config.NumberColumn("序号", width="small"),
+            "区域归属": st.column_config.TextColumn("区域", width="small"),
+            "险种分类": st.column_config.TextColumn("险种", width="medium"),
+            "项目名称": st.column_config.TextColumn("项目名称", width="large"),
+            "标准金额": st.column_config.NumberColumn("招标金额（元）", format="%,.0f"),
+            "招标阶段": st.column_config.TextColumn("阶段", width="small"),
+            "会员详情地址": st.column_config.LinkColumn(
+                "乙方宝会员详情",
+                display_text="打开会员详情 ↗",
+                width="medium",
+            ),
+            "链接状态": st.column_config.TextColumn("链接状态", width="small"),
+        },
+    )
 
 
 def _to_reporting_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1492,7 +1672,7 @@ def _process_uploads(
     engineering_bytes = engineering_file.getvalue()
     config_signature = (
         f"|{min_amount}|{','.join(no_service)}|"
-        f"{_setting('DEEPSEEK_MODEL', 'deepseek-v4-flash')}|v4"
+        f"{_setting('DEEPSEEK_MODEL', 'deepseek-v4-flash')}|v5"
     ).encode("utf-8")
     source_hash = hashlib.sha256(
         insurance_bytes + b"|" + engineering_bytes + config_signature
@@ -1514,8 +1694,12 @@ def _process_uploads(
 
     st.session_state.opp_logs = []
     _log("开始校验两份乙方宝导出文件。")
-    first = parse_yifangbao_excel(insurance_bytes, filename=insurance_file.name)
-    second = parse_yifangbao_excel(engineering_bytes, filename=engineering_file.name)
+    first = _preserve_member_source_urls(
+        parse_yifangbao_excel(insurance_bytes, filename=insurance_file.name)
+    )
+    second = _preserve_member_source_urls(
+        parse_yifangbao_excel(engineering_bytes, filename=engineering_file.name)
+    )
     first_kind = _source_kind(first)
     second_kind = _source_kind(second)
     _log(f"文件识别：{insurance_file.name}={first_kind or '未知'}，{engineering_file.name}={second_kind or '未知'}。")
@@ -2045,6 +2229,17 @@ def _render_outputs(
     min_amount: float = DEFAULT_ENGINEERING_MIN_AMOUNT,
 ) -> None:
     st.subheader("③ 生成今日商机包")
+    flash_message = str(st.session_state.get("opp_flash_message") or "").strip()
+    if flash_message:
+        flash_level = str(st.session_state.get("opp_flash_level") or "success")
+        if flash_level == "warning":
+            st.warning(flash_message)
+        elif flash_level == "info":
+            st.info(flash_message)
+        else:
+            st.success(flash_message)
+        st.session_state.opp_flash_message = ""
+        st.session_state.opp_flash_level = "success"
     report_date = st.date_input(
         "报告日期",
         value=st.session_state.opp_report_date or date.today(),
@@ -2095,20 +2290,30 @@ def _render_outputs(
                 )
                 if selected_count == 0:
                     st.session_state.opp_confirmation_open = False
-                    st.warning("处理已保存，但当前没有保留任何推送项目，因此未生成推送包。")
+                    st.session_state.opp_flash_message = (
+                        "处理已保存，但当前没有保留任何推送项目，因此未生成推送包。"
+                    )
+                    st.session_state.opp_flash_level = "warning"
+                    st.rerun()
                 elif not remaining.empty:
                     st.session_state.opp_confirmation_open = True
                     remaining_names = "；".join(
                         remaining["项目名称"].fillna("").astype(str).head(3).tolist()
                     )
-                    st.error(
+                    st.session_state.opp_flash_message = (
                         f"还有 {len(remaining)} 条未完成确认：{remaining_names}。"
                         "请核对分类、工程金额门槛以及“我已确认可推送”勾选项。"
                     )
+                    st.session_state.opp_flash_level = "info"
+                    st.rerun()
                 else:
                     st.session_state.opp_confirmation_open = False
                     _build_and_store_bundle(frame, report_date)
-                    st.success("确认已保存，正式推送包已生成。")
+                    st.session_state.opp_flash_message = (
+                        "确认已保存，正式推送包已生成；保险会员详情入口也已同步更新。"
+                    )
+                    st.session_state.opp_flash_level = "success"
+                    st.rerun()
 
     bundle = st.session_state.opp_bundle
     if bundle is None:
@@ -2319,8 +2524,8 @@ def main() -> None:
     _render_quality(frame)
     st.subheader("② 确认自动筛选与区域分配")
     st.caption("只有“推送”列被勾选的记录会进入最终文案、图片和Excel。所有自动判断都可以人工覆盖。")
-    insurance_tab, engineering_tab, excluded_tab, ai_tab = st.tabs(
-        ["保险商机", "工程商机", "筛除与质量记录", "AI审查记录"]
+    insurance_tab, insurance_link_tab, engineering_tab, excluded_tab, ai_tab = st.tabs(
+        ["保险商机", "🔗 保险会员详情", "工程商机", "筛除与质量记录", "AI审查记录"]
     )
     with insurance_tab:
         frame = _editor(
@@ -2329,6 +2534,17 @@ def main() -> None:
             "insurance_editor",
             min_amount=float(st.session_state.opp_effective_min_amount),
         )
+    with insurance_link_tab:
+        if st.session_state.opp_input_mode == "会员Excel导入":
+            _render_insurance_member_links(
+                frame,
+                min_amount=float(st.session_state.opp_effective_min_amount),
+            )
+        else:
+            st.info(
+                "“保险会员详情”只读取会员Excel源表中的地址；"
+                "当前是官方公开来源模式，因此这里不展示乙方宝链接。"
+            )
     with engineering_tab:
         frame = _editor(
             frame,
